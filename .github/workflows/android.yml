@@ -20,6 +20,8 @@ jobs:
         with:
           targets: aarch64-linux-android
       - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
       - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
       - run: cargo test --locked -p wordcraft-android
       - run: cargo clippy --locked -p wordcraft-android --target aarch64-linux-android -- -D warnings
