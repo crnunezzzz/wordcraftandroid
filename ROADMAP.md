@@ -712,3 +712,7 @@ Imported Word 97–2003 `.doc`/`.dot` files now ask for a supported DOCX target 
 | 2026-10-12 | trivial | Progress log: recipient filter and sort, .xls and legacy-encoding recipient lists (#778) |
 | 2026-10-15 | trivial | Progress log: dialog close box (#1885) |
 | 2026-10-15 | trivial | Progress log: mixed Hebrew/Latin text keeps its order in Word (#1543) |
+
+### 2026-10-18 — Android host (initial integration)
+
+Added the independent `apps/wordcraft-android` GameActivity/egui host, direct provider API tool loop, Android Keystore key manager, private document workspace and SAF export. Android behavior and remaining platform gaps: [docs/android.md](docs/android.md). Desktop and Office feature-parity scores are unchanged; device validation remains outstanding.

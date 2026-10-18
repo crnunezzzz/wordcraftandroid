@@ -777,6 +777,8 @@ pub fn system_font_dirs() -> Vec<std::path::PathBuf> {
         }
     } else {
         dirs.extend(["/usr/share/fonts", "/usr/local/share/fonts"].map(Into::into));
+        #[cfg(target_os = "android")]
+        dirs.extend(["/system/fonts", "/product/fonts", "/system_ext/fonts"].map(Into::into));
         if let Some(h) = &home {
             dirs.push(h.join(".fonts"));
             dirs.push(h.join(".local/share/fonts"));

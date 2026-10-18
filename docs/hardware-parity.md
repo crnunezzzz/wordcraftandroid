@@ -1,6 +1,6 @@
 # Hardware parity with Microsoft Word
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-15 · **Change:** trivial (Pen / stylus row: two-stroke and closed-head arrows; previously trivial: Pen / stylus row: ink, eraser and Ink to Shape incl. arrows landed; previously trivial: a window too big for its screen shrinks to fit when it opens, #1215; previously trivial: 32-bit Windows starts on OpenGL; previously major: first version) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4 and Word for Windows
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-10-18 · **Change:** trivial (Pen / stylus row: two-stroke and closed-head arrows; previously trivial: Pen / stylus row: ink, eraser and Ink to Shape incl. arrows landed; previously trivial: a window too big for its screen shrinks to fit when it opens, #1215; previously trivial: 32-bit Windows starts on OpenGL; previously major: first version) · **Target:** Microsoft Word (Microsoft 365) for Mac 16.113.4 and Word for Windows
 
 > **Printing update:** 2026-10-12 · direct desktop printing through craft-print; details below.
 
@@ -34,3 +34,7 @@ pens, microphones (Dictate) and speakers (Read Aloud), and displays.
 | 2026-10-10 | trivial | Desktop File › Print opens the PDF in the system viewer (#286) |
 | 2026-10-10 | trivial | Inertial touchpad scrolling landed (#252) |
 | 2026-10-10 | major | First version |
+
+### 2026-10-18 — Android integration
+
+An initial ARM64 GameActivity host now reuses the engine and egui editor, with system font discovery under Android font directories. This adds build and platform integration, not a measured device-parity score. Touch, IME, mouse/keyboard, lifecycle and external-display validation remain open; see [Android](android.md).

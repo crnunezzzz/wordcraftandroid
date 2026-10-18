@@ -104,3 +104,10 @@ debug = 0
 # Required by craft-pdf: the backend rejects writers that failed during unwinding.
 [patch.crates-io]
 krilla = { git = "https://github.com/storytold/craft-libs", rev = "c3487320b2d1de657b860b3c8abb44e1f2b32bd8" }
+
+# Native Android development packages: optimized, without whole-program LTO.
+[profile.android]
+inherits = "release"
+opt-level = 1
+lto = false
+codegen-units = 64

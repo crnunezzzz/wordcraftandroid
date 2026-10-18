@@ -1,0 +1,41 @@
+name: Android APK
+on:
+  workflow_dispatch:
+  push:
+    tags: ['android-v*']
+  pull_request:
+    paths: ['apps/wordcraft-android/**', 'crates/**', 'Cargo.toml', 'Cargo.lock', '.github/workflows/android.yml']
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - uses: android-actions/setup-android@v3
+      - run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;28.2.13676358'
+      - run: cargo test --locked -p wordcraft-android
+      - run: cargo clippy --locked -p wordcraft-android --target aarch64-linux-android -- -D warnings
+        env:
+          CXX_aarch64_linux_android: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android26-clang++
+      - run: ./apps/wordcraft-android/build-apk.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wordcraft-android-arm64
+          path: apps/wordcraft-android/android/app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish APK release
+        if: startsWith(github.ref, 'refs/tags/android-v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp apps/wordcraft-android/android/app/build/outputs/apk/debug/app-debug.apk WordCraft-Android-arm64.apk
+          gh release create "$GITHUB_REF_NAME" WordCraft-Android-arm64.apk \
+            --title "WordCraft Android $GITHUB_REF_NAME" \
+            --notes "APK ARM64 de desarrollo para Android 8 o posterior. Instala la APK desde Archivos. Clave debug; la publicación no está firmada para Play Store."

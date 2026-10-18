@@ -383,3 +383,7 @@ Forks and modified versions must remove them.
   <a href="https://getartcraft.com/"><img alt="ArtCraft" src="docs/brand/artcraft-mark.svg" width="28"></a><br>
   <sub>Made by the <a href="https://getartcraft.com/">ArtCraft</a> team and community.</sub>
 </p>
+
+## Android tablet port
+
+An independent native Android host is available in `apps/wordcraft-android`. It reuses the existing editor and adds direct API agents and Android Keystore credentials. See [Android build, behavior and validation limits](docs/android.md). This is an initial port; Android feature parity is not yet certified.

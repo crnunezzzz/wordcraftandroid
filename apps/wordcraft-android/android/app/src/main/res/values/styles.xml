@@ -1,0 +1,8 @@
+<resources>
+    <style name="CraftTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="android:windowActionModeOverlay">true</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowSoftInputMode">adjustResize</item>
+        <item name="android:colorAccent">#3273BA</item>
+    </style>
+</resources>
