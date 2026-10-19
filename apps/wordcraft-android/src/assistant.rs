@@ -287,6 +287,16 @@ fn markdown(ui: &mut Ui, text: &str, palette: &Palette) {
     }
 }
 
+/// The panel's text uses egui's own families: an editor may name a family of its own that is
+/// empty without its optional font pack, and laying text out with it would fail.
+fn own_fonts(ui: &mut Ui) {
+    for font in ui.style_mut().text_styles.values_mut() {
+        if font.family != egui::FontFamily::Monospace {
+            font.family = egui::FontFamily::Proportional;
+        }
+    }
+}
+
 fn provider_title(provider: Provider) -> &'static str {
     match provider {
         Provider::Anthropic => "Claude (Anthropic)",
@@ -388,6 +398,7 @@ impl Assistant {
         paint_icon(ui.painter(), Icon::Chevron, Rect::from_center_size(pos2(rect.max.x - 19.0, rect.center().y), Vec2::splat(16.0)), palette.weak);
         response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::ComboBox, true, "Modelo"));
         egui::Popup::menu(&response).show(|ui| {
+            own_fonts(ui);
             ui.set_min_width(300.0);
             ui.spacing_mut().button_padding = vec2(10.0, 8.0);
             for provider in [Provider::Anthropic, Provider::OpenAi] {
@@ -720,6 +731,7 @@ impl Assistant {
     }
 
     fn contents(&mut self, ui: &mut Ui, palette: &Palette, brand: &Branding) {
+        own_fonts(ui);
         ui.spacing_mut().interact_size.y = ui.spacing().interact_size.y.max(30.0);
         ui.spacing_mut().button_padding = vec2(12.0, 7.0);
         self.header(ui, palette);
