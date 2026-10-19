@@ -2,14 +2,16 @@
 
 use crate::{
     adapter::Editor,
-    assistant::{Action, Assistant, Busy, COMPOSER_ID, Entry, Settings, Step, View},
+    assistant::{Action, Assistant, Busy, COMPOSER_ID, Chip, Entry, Settings, Step, View},
+    attach::{self, Attachment},
     platform::Platform,
     protocol::{self, Degrade, Thread},
 };
 use egui::{Color32, Context, Key, Ui};
 use serde_json::{Value, json};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender},
     time::{Duration, Instant},
 };
 use zeroize::Zeroize;
@@ -19,6 +21,8 @@ use zeroize::Zeroize;
 fn now() -> Instant {
     Instant::now()
 }
+
+type Prepared = Result<Attachment, String>;
 
 /// One user message being worked on: model rounds and tool calls until the model answers.
 struct Run {
@@ -45,7 +49,12 @@ pub struct Mobile {
     last_recovery: Instant,
     last_back: Option<Instant>,
     chrome: Option<(Color32, Color32, bool)>,
-    zoom: f32,
+    /// The system's display scale (native pixels per point).
+    native: f32,
+    /// The picker opened for an attachment.
+    attach_ticket: Option<u64>,
+    /// Attachments prepared off the UI thread.
+    prepared: (Sender<Prepared>, Receiver<Prepared>),
 }
 
 pub fn start(app: android_activity::AndroidApp) {
@@ -91,7 +100,9 @@ pub fn start(app: android_activity::AndroidApp) {
                 last_recovery: now(),
                 last_back: None,
                 chrome: None,
-                zoom: 0.0,
+                native: 1.0,
+                attach_ticket: None,
+                prepared: mpsc::channel(),
             }))
         }),
     );
@@ -129,7 +140,10 @@ impl Mobile {
         match self.platform.exchange(json!({"op":"poll"})) {
             Ok(events) => {
                 for event in events.as_array().into_iter().flatten() {
-                    if event["kind"] == "http" {
+                    if event["kind"] == "file" && self.attach_ticket.is_some() && event["ticket"].as_u64() == self.attach_ticket {
+                        self.attach_ticket = None;
+                        self.picked(event);
+                    } else if event["kind"] == "http" {
                         if self.run.as_ref().is_some_and(|r| Some(r.ticket) == event["ticket"].as_u64()) {
                             self.reply(event);
                             ctx.request_repaint();
@@ -146,6 +160,96 @@ impl Mobile {
             }
             Err(e) => self.status = e,
         }
+        while let Ok(result) = self.prepared.1.try_recv() {
+            self.assistant.attaching = false;
+            match result {
+                Ok(mut file) if self.assistant.attachments.len() < attach::MAX_FILES => {
+                    if let Some(thumb) = file.thumb.take() {
+                        file.texture = Some(ctx.load_texture(format!("attachment-{}", self.next_ticket), thumb, egui::TextureOptions::LINEAR));
+                        self.next_ticket = self.next_ticket.saturating_add(1);
+                    }
+                    self.assistant.attachments.push(file);
+                }
+                Ok(_) => self.assistant.attach_error = Some(format!("Como máximo {} archivos por mensaje.", attach::MAX_FILES)),
+                Err(e) => self.assistant.attach_error = Some(e),
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    /// Prepare a file off the UI thread; `remove` deletes it afterwards (a private copy).
+    fn prepare(&mut self, path: PathBuf, name: String, remove: bool) {
+        let tx = self.prepared.0.clone();
+        let documents = self.dir.join("documents");
+        self.assistant.attaching = true;
+        let spawned = std::thread::Builder::new().name("craft-attach".into()).spawn(move || {
+            let result = match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() > attach::MAX_FILE => {
+                    Err(format!("«{name}» pesa {}; el máximo es {}.", attach::size(meta.len() as usize), attach::size(attach::MAX_FILE as usize)))
+                }
+                Ok(_) => std::fs::read(&path).map_err(|_| format!("No se pudo leer «{name}».")).and_then(|bytes| attach::prepare(&name, &bytes)),
+                Err(_) => Err(format!("No se pudo leer «{name}».")),
+            };
+            if remove {
+                discard_copy(&path, &documents);
+            }
+            let _ = tx.send(result);
+        });
+        if spawned.is_err() {
+            self.assistant.attaching = false;
+            self.assistant.attach_error = Some("No se pudo preparar el archivo.".into());
+        }
+    }
+
+    /// The Android picker answered for an attachment.
+    fn picked(&mut self, event: &Value) {
+        if let Some(error) = event["error"].as_str() {
+            self.assistant.attaching = false;
+            self.assistant.attach_error = Some(error.into());
+        } else if let Some(path) = event["path"].as_str() {
+            let name = event["name"].as_str().unwrap_or("archivo").to_owned();
+            self.prepare(PathBuf::from(path), name, true);
+        } else {
+            self.assistant.attaching = false;
+        }
+    }
+
+    fn attach(&mut self) {
+        if self.assistant.attaching || self.attach_ticket.is_some() {
+            return;
+        }
+        self.assistant.attach_error = None;
+        if self.assistant.attachments.len() >= attach::MAX_FILES {
+            self.assistant.attach_error = Some(format!("Como máximo {} archivos por mensaje.", attach::MAX_FILES));
+            return;
+        }
+        self.next_ticket = self.next_ticket.saturating_add(1);
+        let ticket = self.next_ticket;
+        match self.platform.exchange(json!({"op":"open","ticket":ticket,"purpose":"assistant"})) {
+            Ok(_) => {
+                self.attach_ticket = Some(ticket);
+                self.assistant.attaching = true;
+            }
+            Err(e) => self.assistant.attach_error = Some(e),
+        }
+    }
+
+    fn paste_image(&mut self) {
+        if self.assistant.attaching {
+            return;
+        }
+        self.assistant.attach_error = None;
+        if self.assistant.attachments.len() >= attach::MAX_FILES {
+            self.assistant.attach_error = Some(format!("Como máximo {} archivos por mensaje.", attach::MAX_FILES));
+            return;
+        }
+        match self.platform.exchange(json!({"op":"clipboard_image"})) {
+            Ok(value) => match value["path"].as_str() {
+                Some(path) => self.prepare(PathBuf::from(path), "Imagen pegada".into(), false),
+                None => self.assistant.attach_error = Some("No hay ninguna imagen copiada en el portapapeles.".into()),
+            },
+            Err(e) => self.assistant.attach_error = Some(e),
+        }
     }
 
     /// Send the conversation as it is now.
@@ -156,6 +260,15 @@ impl Mobile {
         run.ticket = self.next_ticket;
         run.rounds += 1;
         let mut request = thread.request(&protocol::system_prompt(Editor::NAME), &self.assistant.settings.effort, run.degrade);
+        let size = request["body"].to_string().len();
+        if size > protocol::MAX_REQUEST {
+            self.run = None;
+            if let Some(thread) = &mut self.thread {
+                thread.close_pending("The request grew too large.");
+            }
+            self.assistant.entries.push(Entry::Error { text: too_large(size), retry: false, key: false });
+            return;
+        }
         request["ticket"] = json!(run.ticket);
         if let Err(e) = self.platform.exchange(request) {
             self.run = None;
@@ -165,9 +278,10 @@ impl Mobile {
 
     fn send(&mut self, text: String) {
         let text = text.trim().to_owned();
-        if text.is_empty() || self.run.is_some() {
+        if (text.is_empty() && self.assistant.attachments.is_empty()) || self.run.is_some() || self.assistant.attaching {
             return;
         }
+        let chips: Vec<Chip> = self.assistant.attachments.iter().map(Chip::from).collect();
         if !self.assistant.settings.ai {
             self.assistant.entries.push(Entry::Notice("El acceso a la IA está desactivado en Ajustes.".into()));
             self.assistant.prompt = text;
@@ -176,7 +290,7 @@ impl Mobile {
         let model = self.assistant.model();
         let provider = protocol::provider_of(&model);
         if !self.assistant.has_key(provider) {
-            self.assistant.entries.push(Entry::User(text.clone()));
+            self.assistant.entries.push(Entry::User { text: text.clone(), files: chips });
             self.assistant.entries.push(Entry::Error { text: format!("Falta la clave de API de {}.", provider.name()), retry: false, key: true });
             self.assistant.prompt = text;
             return;
@@ -189,9 +303,22 @@ impl Mobile {
             }
             self.thread = None;
         }
+        // Files are checked against the request limit before they join the history for good.
+        let weight: usize = self.assistant.attachments.iter().map(Attachment::weight).sum();
+        if weight > 0 {
+            let history = self.thread.as_ref().map_or(0, |t| t.request("", "low", Degrade::default())["body"].to_string().len());
+            if history + weight + protocol::MAX_CONTEXT > protocol::MAX_REQUEST {
+                self.assistant.attach_error = Some(too_large(history + weight));
+                self.assistant.prompt = text;
+                return;
+            }
+        }
+        let files = std::mem::take(&mut self.assistant.attachments);
+        self.assistant.attach_error = None;
         let context = self.editor.context();
-        self.thread.get_or_insert_with(|| Thread::new(&model)).push_user(protocol::user_message(&text, &context));
-        self.assistant.entries.push(Entry::User(text));
+        let ask = if text.is_empty() { "Revisa los archivos adjuntos." } else { text.as_str() };
+        self.thread.get_or_insert_with(|| Thread::new(&model)).push_user(protocol::user_message(ask, &context), &files);
+        self.assistant.entries.push(Entry::User { text, files: chips });
         self.run = Some(Run { ticket: 0, rounds: 0, calls: 0, started: now(), degrade: Degrade::default() });
         self.request();
     }
@@ -368,6 +495,19 @@ impl Mobile {
                     Ok(flags) => self.assistant.set_key_flags(&flags),
                     Err(e) => self.status = e,
                 },
+                Action::Attach => self.attach(),
+                Action::PasteImage => self.paste_image(),
+                Action::RemoveAttachment(index) => {
+                    if index < self.assistant.attachments.len() {
+                        self.assistant.attachments.remove(index);
+                    }
+                    self.assistant.attach_error = None;
+                }
+                Action::SetScale(scale) => {
+                    self.editor.set_interface_scale(self.native, scale);
+                    self.assistant.ui_scale = self.editor.interface_scale(self.native);
+                    self.save_settings();
+                }
             }
         }
     }
@@ -422,11 +562,10 @@ impl eframe::App for Mobile {
         if !self.assistant.settings.ai {
             self.stop();
         }
-        let scale = self.assistant.settings.ui_scale.clamp(0.8, 1.5);
-        if (scale - self.zoom).abs() > 1e-3 {
-            self.zoom = scale;
-            ctx.set_zoom_factor(scale);
-        }
+        // The interface size is the editor's own preference: it sets egui's zoom every frame,
+        // so the assistant changes that preference rather than the zoom itself.
+        self.native = ctx.native_pixels_per_point().filter(|n| n.is_finite() && *n > 0.0).unwrap_or(1.0);
+        self.assistant.ui_scale = self.editor.interface_scale(self.native);
         // egui's own Ctrl +/- zoom would fight the editor's document zoom shortcuts.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         self.poll(ctx);
@@ -528,5 +667,24 @@ impl eframe::App for Mobile {
         self.editor.recover(&self.dir);
         self.save_settings();
         self.assistant.zeroize_keys();
+    }
+}
+
+fn too_large(size: usize) -> String {
+    format!(
+        "Con los adjuntos, la conversación ocuparía {} y el máximo por petición es {}. Quita algún archivo o empieza una conversación nueva (+).",
+        attach::size(size),
+        attach::size(protocol::MAX_REQUEST)
+    )
+}
+
+/// Delete the private copy the picker made (`documents/<uuid>/<name>`) and its folder.
+fn discard_copy(path: &Path, documents: &Path) {
+    let (Ok(file), Ok(root)) = (path.canonicalize(), documents.canonicalize()) else { return };
+    if let Some(folder) = file.parent()
+        && folder.parent() == Some(root.as_path())
+    {
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(folder);
     }
 }

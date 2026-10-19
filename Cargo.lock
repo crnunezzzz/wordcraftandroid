@@ -5171,7 +5171,9 @@ dependencies = [
  "eframe",
  "egui",
  "egui_kittest",
+ "image",
  "jni",
+ "quick-xml",
  "serde",
  "serde_json",
  "wordcraft-doc",
@@ -5180,6 +5182,7 @@ dependencies = [
  "wordcraft-proof",
  "wordcraft-ui-egui",
  "zeroize",
+ "zip",
 ]
 
 [[package]]

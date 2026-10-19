@@ -87,3 +87,17 @@ Validación: cinco pruebas Java por aplicación, compilación release ARM64, fir
 **Validación.** Pruebas Rust de gestos, teclado y protocolo (`cargo test -p wordcraft-android`) y Clippy con `-D warnings` para `aarch64-linux-android`. La APK se compila con el motor release (opt-level 3) y se firma con v2 y v3; zipalign comprueba la alineación de 16 KiB. No se ha probado en una tablet física: el comportamiento del trackpad del teclado Xiaomi y las barras del sistema de HyperOS deben verificarse en el dispositivo.
 
 **Firma.** Las APK de android.6 se firmaron con una clave nueva, porque la clave de android.4/5 no estaba disponible en el entorno de compilación. Android no permite actualizar sobre una firma distinta: exporta tus documentos, desinstala la versión anterior e instala android.6. La desinstalación borra los documentos privados y las claves API de la app.
+
+## Corrección Android.7 — 2026-10-19
+
+**Tamaño de la interfaz.** El ajuste del asistente no tenía efecto: fijaba el zoom de egui, y el editor vuelve a imponer en cada fotograma el zoom de su propia preferencia de tamaño de interfaz. Ahora el asistente lee y cambia esa misma preferencia (`adapter.rs`), que se guarda con las demás del editor y coincide con la de sus opciones. El control pasa de un deslizador, que se desplazaba bajo el dedo al reescalar toda la interfaz, a botones − / + en pasos de 75 a 150 % y «Restablecer».
+
+**Adjuntos.** El compositor del asistente tiene un botón de clip: «Imagen o archivo…» abre el selector de Android y «Pegar imagen copiada» toma la imagen del portapapeles. `src/attach.rs` prepara cada archivo en un hilo aparte:
+- Imágenes (JPEG, PNG, GIF, WebP, BMP): se reducen a 1568 px en el lado mayor y viajan como imagen; las fotos HEIC/AVIF se rechazan con un mensaje.
+- PDF (hasta 12 MB): viajan enteros y el modelo lee texto, tablas y figuras.
+- Word, Excel, PowerPoint y OpenDocument: se extrae su texto (las hojas, celda a celda con sus fórmulas).
+- Texto plano, Markdown, CSV, JSON o código: se envía tal cual.
+
+El texto se recorta a 120 KB. Se admiten hasta ocho archivos por mensaje, con miniaturas en el compositor y en la conversación. Cada proveedor recibe sus propios bloques: `input_image`/`input_file` en la API Responses de OpenAI, `image`/`document` en la Messages API de Anthropic. Como cada petición reenvía la conversación entera, el host comprueba el tamaño antes de enviar (máximo 28 MB; Java admite 32 MB) y, si no cabe, pide quitar archivos o empezar otra conversación. La copia privada que hace el selector se borra tras leerla.
+
+**Validación.** Pruebas Rust de preparación de adjuntos (escalado, PDF, texto, Office, ODF) y de los bloques de cada proveedor. Clippy con `-D warnings` para `aarch64-linux-android` y escritorio. El estado «attachments» de `assistant_preview` muestra los archivos. No se ha probado en una tablet física. Android.7 conserva la firma de android.6 y sube versionCode a 5, así que se instala como actualización.

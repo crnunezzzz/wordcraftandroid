@@ -3,9 +3,13 @@
 //! tested off the device (`cargo run -p <app>-android --example assistant_preview`).
 #![forbid(unsafe_code)]
 
-use crate::protocol::{self, MODELS, Provider};
+use crate::{
+    attach::Attachment,
+    protocol::{self, MODELS, Provider},
+};
 use egui::{
-    Align, Align2, Color32, Context, CornerRadius, Frame, Key, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, Ui, Vec2, pos2, vec2,
+    Align, Align2, Color32, Context, CornerRadius, Frame, Key, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle, Ui, Vec2,
+    pos2, vec2,
 };
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
@@ -28,11 +32,27 @@ pub struct Settings {
     /// Empty: the recommended model of whichever provider has a key.
     pub model: String,
     pub effort: String,
-    pub ui_scale: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { ai: true, model: String::new(), effort: "medium".into(), ui_scale: 1.0 }
+        Self { ai: true, model: String::new(), effort: "medium".into() }
+    }
+}
+
+/// Interface sizes the settings step through (zoom over the system's own scale).
+pub const SCALES: [f32; 9] = [0.75, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5];
+
+/// A sent file as the conversation shows it (its bytes went to the provider).
+#[derive(Clone)]
+pub struct Chip {
+    pub name: String,
+    pub detail: String,
+    pub tag: String,
+    pub texture: Option<TextureHandle>,
+}
+impl From<&Attachment> for Chip {
+    fn from(file: &Attachment) -> Self {
+        Self { name: file.name.clone(), detail: file.detail.clone(), tag: file.tag(), texture: file.texture.clone() }
     }
 }
 
@@ -43,7 +63,7 @@ pub struct Step {
 }
 
 pub enum Entry {
-    User(String),
+    User { text: String, files: Vec<Chip> },
     Assistant(String),
     Steps(Vec<Step>),
     Error { text: String, retry: bool, key: bool },
@@ -66,6 +86,13 @@ pub enum Action {
     SaveSettings,
     SetKey(Provider, String),
     DeleteKey(Provider),
+    /// Open Android's file picker for an attachment.
+    Attach,
+    /// Attach the image on the clipboard.
+    PasteImage,
+    RemoveAttachment(usize),
+    /// The interface size, as a zoom over the system's scale.
+    SetScale(f32),
 }
 
 /// Work in progress, as the host reports it each frame.
@@ -78,6 +105,13 @@ pub struct Busy {
 #[derive(Default)]
 pub struct Assistant {
     pub settings: Settings,
+    /// The editor's interface size, as the host reads it each frame.
+    pub ui_scale: f32,
+    /// Files for the next message.
+    pub attachments: Vec<Attachment>,
+    /// A file is being picked or prepared.
+    pub attaching: bool,
+    pub attach_error: Option<String>,
     pub key_edits: [String; 2],
     /// Saved keys: [OpenAI, Anthropic], from the Keystore's flags.
     pub keys: [bool; 2],
@@ -87,6 +121,7 @@ pub struct Assistant {
     pub entries: Vec<Entry>,
     pub busy: Option<Busy>,
     actions: Vec<Action>,
+    composer_height: f32,
 }
 
 pub const COMPOSER_ID: &str = "assistant_composer";
@@ -140,6 +175,7 @@ enum Icon {
     Send,
     Stop,
     Chevron,
+    Attach,
 }
 
 fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
@@ -207,18 +243,41 @@ fn paint_icon(painter: &egui::Painter, icon: Icon, rect: Rect, color: Color32) {
         Icon::Stop => {
             painter.rect_filled(Rect::from_center_size(c, Vec2::splat(r * 0.75)), 2.0, color);
         }
+        Icon::Attach => {
+            // A paper clip: three straight runs joined by two half turns, tilted.
+            let mut points = Vec::new();
+            let mut arc = |center: Vec2, radius: f32, from: f32, to: f32| {
+                for i in 0..=10 {
+                    let a = from + (to - from) * i as f32 / 10.0;
+                    points.push(center + radius * vec2(a.cos(), a.sin()));
+                }
+            };
+            use std::f32::consts::PI;
+            arc(vec2(-0.06, 0.38), 0.18, 0.0, PI);
+            arc(vec2(0.03, -0.5), 0.27, PI, 2.0 * PI);
+            let mut path = vec![vec2(0.12, -0.3)];
+            path.extend(points);
+            path.push(vec2(0.30, 0.22));
+            let (sin, cos) = 0.7f32.sin_cos();
+            let points = path.into_iter().map(|p| c + r * 1.35 * vec2(p.x * cos - p.y * sin, p.x * sin + p.y * cos)).collect();
+            painter.add(Shape::line(points, stroke));
+        }
     }
 }
 
 /// A round icon button with a touch-sized hit area.
 fn icon_button(ui: &mut Ui, icon: Icon, hint: &str, palette: &Palette) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+    sized_icon_button(ui, icon, hint, palette, 40.0)
+}
+
+fn sized_icon_button(ui: &mut Ui, icon: Icon, hint: &str, palette: &Palette, side: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(side), Sense::click());
     let enabled = ui.is_enabled();
     if enabled && (response.hovered() || response.is_pointer_button_down_on()) {
-        ui.painter().circle_filled(rect.center(), 19.0, palette.border.gamma_multiply(0.5));
+        ui.painter().circle_filled(rect.center(), side / 2.0 - 1.0, palette.border.gamma_multiply(0.5));
     }
     let color = if enabled { palette.text } else { palette.weak.gamma_multiply(0.6) };
-    paint_icon(ui.painter(), icon, rect.shrink(11.0), color);
+    paint_icon(ui.painter(), icon, rect.shrink(side * 0.275), color);
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, hint));
     response.on_hover_text(hint)
 }
@@ -287,6 +346,58 @@ fn markdown(ui: &mut Ui, text: &str, palette: &Palette) {
     }
 }
 
+/// An attached file: its thumbnail or type, name and size; returns whether × was pressed.
+/// Drawn at a fixed size so it sits the same in left- and right-aligned rows.
+fn file_chip(ui: &mut Ui, chip: &Chip, palette: &Palette, removable: bool) -> bool {
+    let line = |text: &str, size: f32, color: Color32| {
+        let mut job = egui::text::LayoutJob::simple_singleline(text.to_owned(), egui::FontId::proportional(size), color);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(170.0);
+        ui.painter().layout_job(job)
+    };
+    let name = line(&chip.name, 13.5, palette.text);
+    let detail = line(&chip.detail, 12.0, palette.weak);
+    let text_width = name.size().x.max(detail.size().x);
+    let size = vec2(6.0 + 38.0 + 10.0 + text_width + if removable { 38.0 } else { 14.0 }, 50.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
+    let painter = ui.painter();
+    painter.rect(rect, CornerRadius::same(12), palette.bg, Stroke::new(1.0, palette.border), egui::StrokeKind::Inside);
+    let thumb = Rect::from_min_size(rect.min + vec2(6.0, 6.0), Vec2::splat(38.0));
+    if let Some(texture) = &chip.texture {
+        // Fill the square, cropping the longer side.
+        let size = texture.size_vec2();
+        let (w, h) = (size.x.max(1.0), size.y.max(1.0));
+        let uv = if w > h {
+            let k = (1.0 - h / w) / 2.0;
+            Rect::from_min_max(pos2(k, 0.0), pos2(1.0 - k, 1.0))
+        } else {
+            let k = (1.0 - w / h) / 2.0;
+            Rect::from_min_max(pos2(0.0, k), pos2(1.0, 1.0 - k))
+        };
+        painter.image(texture.id(), thumb, uv, Color32::WHITE);
+        painter.rect_stroke(thumb, 6, Stroke::new(1.0, palette.border), egui::StrokeKind::Inside);
+    } else {
+        painter.rect_filled(thumb, 8, palette.accent.gamma_multiply(0.14));
+        painter.text(thumb.center(), Align2::CENTER_CENTER, &chip.tag, egui::FontId::proportional(11.0), palette.accent);
+    }
+    let x = thumb.max.x + 10.0;
+    let top = rect.center().y - (name.size().y + detail.size().y + 1.0) / 2.0;
+    let below = top + name.size().y + 1.0;
+    painter.galley(pos2(x, top), name, palette.text);
+    painter.galley(pos2(x, below), detail, palette.weak);
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &chip.name));
+    if !removable {
+        return false;
+    }
+    let close = Rect::from_center_size(pos2(rect.max.x - 21.0, rect.center().y), Vec2::splat(32.0));
+    let button = ui.interact(close, response.id.with("remove"), Sense::click());
+    if button.hovered() || button.is_pointer_button_down_on() {
+        ui.painter().circle_filled(close.center(), 15.0, palette.border.gamma_multiply(0.5));
+    }
+    paint_icon(ui.painter(), Icon::Close, close.shrink(9.0), palette.text);
+    button.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, "Quitar el archivo"));
+    button.on_hover_text("Quitar el archivo").clicked()
+}
+
 /// The panel's text uses egui's own families: an editor may name a family of its own that is
 /// empty without its optional font pack, and laying text out with it would fail.
 fn own_fonts(ui: &mut Ui) {
@@ -306,7 +417,7 @@ fn provider_title(provider: Provider) -> &'static str {
 
 impl Assistant {
     pub fn new(settings: Settings) -> Self {
-        Self { settings, ..Default::default() }
+        Self { settings, ui_scale: 1.0, ..Default::default() }
     }
 
     pub fn has_key(&self, provider: Provider) -> bool {
@@ -456,7 +567,7 @@ impl Assistant {
                 self.actions.push(Action::SaveSettings);
             }
             ui.add_space(4.0);
-            note(ui, "Cada mensaje envía tu petición y el contenido del documento abierto al proveedor elegido; el asistente lo lee y lo edita con las mismas órdenes que la línea de comandos. «Desactivado» garantiza que ninguna petición sale del dispositivo.");
+            note(ui, "Cada mensaje envía tu petición, el contenido del documento abierto y los archivos que adjuntes al proveedor elegido; el asistente lo lee y lo edita con las mismas órdenes que la línea de comandos. «Desactivado» garantiza que ninguna petición sale del dispositivo.");
 
             section(ui, "Claves de API");
             note(ui, "Fija un límite de gasto en tu cuenta: esa misma página muestra lo que has usado. Las claves se cifran con el Android Keystore y solo viajan a su proveedor.");
@@ -522,14 +633,28 @@ impl Assistant {
             note(ui, "Más razonamiento da respuestas más cuidadosas, pero más lentas y caras.");
 
             section(ui, "Pantalla y gestos");
-            let mut percent = (self.settings.ui_scale * 100.0).round();
+            // Steps, not a slider: the whole interface rescales under the finger as it changes.
+            let current = self.ui_scale;
+            let smaller = SCALES.iter().rev().copied().find(|s| *s < current - 0.01);
+            let larger = SCALES.iter().copied().find(|s| *s > current + 0.01);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Tamaño de la interfaz").color(palette.text));
-                if ui.add(egui::Slider::new(&mut percent, 80.0..=150.0).step_by(5.0).suffix(" %")).changed() {
-                    self.settings.ui_scale = (percent / 100.0).clamp(0.8, 1.5);
-                    self.actions.push(Action::SaveSettings);
-                }
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let step = |ui: &mut Ui, label: &str, to: Option<f32>| {
+                        let button = egui::Button::new(RichText::new(label).size(20.0)).corner_radius(10).min_size(vec2(46.0, 40.0));
+                        ui.add_enabled(to.is_some(), button).clicked().then_some(to).flatten()
+                    };
+                    let mut chosen = step(ui, "+", larger);
+                    ui.add_sized(vec2(64.0, 40.0), egui::Label::new(RichText::new(format!("{:.0} %", current * 100.0)).size(15.0).strong().color(palette.strong)));
+                    chosen = chosen.or(step(ui, "−", smaller));
+                    if let Some(scale) = chosen {
+                        self.actions.push(Action::SetScale(scale));
+                    }
+                });
             });
+            if (current - 1.0).abs() > 0.01 && ui.button("Restablecer (100 %)").clicked() {
+                self.actions.push(Action::SetScale(1.0));
+            }
             ui.add_space(4.0);
             note(ui, "Un dedo desplaza la página · tocar = clic · mantener = menú contextual · mantener y arrastrar = seleccionar · dos dedos = zoom. Ratón, lápiz y trackpad funcionan como en el escritorio; Atrás cierra paneles y menús.");
             ui.add_space(18.0);
@@ -553,12 +678,13 @@ impl Assistant {
                 i.events.retain(|e| !matches!(e, egui::Event::Key { key: Key::Enter, physical_key: Some(_), modifiers, .. } if !modifiers.shift));
                 before != i.events.len()
             });
-        Frame::new()
+        let frame = Frame::new()
             .fill(palette.card)
             .stroke(Stroke::new(1.0, palette.border))
             .corner_radius(22)
             .inner_margin(Margin { left: 16, right: 8, top: 12, bottom: 8 })
             .show(ui, |ui| {
+                self.pending_files(ui, palette);
                 ui.add(
                     egui::TextEdit::multiline(&mut self.prompt)
                         .id(id)
@@ -569,6 +695,30 @@ impl Assistant {
                         .font(egui::FontId::proportional(15.0)),
                 );
                 ui.horizontal(|ui| {
+                    let attach = ui
+                        .add_enabled_ui(!self.attaching, |ui| sized_icon_button(ui, Icon::Attach, "Adjuntar imagen o archivo", palette, 40.0))
+                        .inner;
+                    egui::Popup::menu(&attach).show(|ui| {
+                        own_fonts(ui);
+                        ui.set_min_width(250.0);
+                        let row = |ui: &mut Ui, label: &str| {
+                            ui.add(egui::Button::new(RichText::new(label).size(14.5)).frame(false).min_size(vec2(ui.available_width(), 38.0)))
+                        };
+                        if row(ui, "Imagen o archivo…").clicked() {
+                            self.actions.push(Action::Attach);
+                            ui.close();
+                        }
+                        if row(ui, "Pegar imagen copiada").clicked() {
+                            self.actions.push(Action::PasteImage);
+                            ui.close();
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("Imágenes, PDF, Word, Excel, PowerPoint, OpenDocument y texto").small().color(palette.weak),
+                            )
+                            .wrap(),
+                        );
+                    });
                     if let Some(busy) = self.busy {
                         ui.spinner();
                         let doing = if busy.editing { "Trabajando en el documento" } else { "Pensando" };
@@ -577,7 +727,7 @@ impl Assistant {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let (rect, response) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
                         let running = self.busy.is_some();
-                        let ready = !self.prompt.trim().is_empty();
+                        let ready = (!self.prompt.trim().is_empty() || !self.attachments.is_empty()) && !self.attaching;
                         let fill = if running || ready { palette.accent } else { palette.border.gamma_multiply(0.8) };
                         ui.painter().circle_filled(rect.center(), 20.0, fill);
                         paint_icon(
@@ -598,9 +748,46 @@ impl Assistant {
                     });
                 });
             });
-        if send_key && self.busy.is_none() && !self.prompt.trim().is_empty() {
+        self.composer_height = frame.response.rect.height();
+        if send_key && self.busy.is_none() && !self.attaching && (!self.prompt.trim().is_empty() || !self.attachments.is_empty()) {
             self.actions.push(Action::Send(std::mem::take(&mut self.prompt)));
         }
+    }
+
+    /// The files waiting for the next message, above the text field.
+    fn pending_files(&mut self, ui: &mut Ui, palette: &Palette) {
+        if self.attachments.is_empty() && !self.attaching && self.attach_error.is_none() {
+            return;
+        }
+        let mut remove = None;
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+            for (index, file) in self.attachments.iter().enumerate() {
+                if file_chip(ui, &Chip::from(file), palette, true) {
+                    remove = Some(index);
+                }
+            }
+            if self.attaching {
+                Frame::new()
+                    .fill(palette.bg)
+                    .stroke(Stroke::new(1.0, palette.border))
+                    .corner_radius(12)
+                    .inner_margin(Margin::symmetric(12, 15))
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("Preparando el archivo…").size(13.5).color(palette.weak));
+                        });
+                    });
+            }
+        });
+        if let Some(error) = &self.attach_error {
+            ui.add(egui::Label::new(RichText::new(error).size(13.5).color(palette.error)).wrap());
+        }
+        if let Some(index) = remove {
+            self.actions.push(Action::RemoveAttachment(index));
+        }
+        ui.add_space(6.0);
     }
 
     fn chat_view(&mut self, ui: &mut Ui, palette: &Palette, brand: &Branding) {
@@ -633,7 +820,8 @@ impl Assistant {
             });
             return;
         }
-        let composer_height = 124.0;
+        // The composer grows with its files; last frame's height leaves it room.
+        let composer_height = self.composer_height.max(112.0) + 12.0;
         let list_height = (ui.available_height() - composer_height).max(80.0);
         let mut retry = false;
         let mut settings = false;
@@ -646,17 +834,30 @@ impl Assistant {
                 for (index, entry) in self.entries.iter().enumerate() {
                     ui.add_space(10.0);
                     match entry {
-                        Entry::User(text) => {
-                            ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-                                Frame::new()
-                                    .fill(palette.accent.gamma_multiply(0.13))
-                                    .corner_radius(18)
-                                    .inner_margin(Margin::symmetric(14, 10))
-                                    .show(ui, |ui| {
-                                        ui.set_max_width(width * 0.82);
-                                        ui.add(egui::Label::new(RichText::new(text).size(15.0).color(palette.text)).wrap().selectable(true));
-                                    });
-                            });
+                        Entry::User { text, files } => {
+                            if !files.is_empty() {
+                                ui.with_layout(Layout::right_to_left(Align::Min).with_main_wrap(true), |ui| {
+                                    ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                    for file in files {
+                                        file_chip(ui, file, palette, false);
+                                    }
+                                });
+                            }
+                            if !text.is_empty() {
+                                if !files.is_empty() {
+                                    ui.add_space(4.0);
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                    Frame::new()
+                                        .fill(palette.accent.gamma_multiply(0.13))
+                                        .corner_radius(18)
+                                        .inner_margin(Margin::symmetric(14, 10))
+                                        .show(ui, |ui| {
+                                            ui.set_max_width(width * 0.82);
+                                            ui.add(egui::Label::new(RichText::new(text).size(15.0).color(palette.text)).wrap().selectable(true));
+                                        });
+                                });
+                            }
                         }
                         Entry::Assistant(text) => markdown(ui, text, palette),
                         Entry::Steps(steps) => {

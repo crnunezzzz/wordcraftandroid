@@ -81,7 +81,9 @@ public final class CraftActivity extends GameActivity {
     private final ConcurrentLinkedQueue<JSONObject> exportDialogs = new ConcurrentLinkedQueue<>();
     private static final int PICK = 4101;
     private static final int LIMIT = 128 * 1024 * 1024;
-    private static final int HTTP_LIMIT = 2 * 1024 * 1024;
+    // Requests carry attached images and PDFs inline (base64); the providers accept 32 MB.
+    private static final int HTTP_LIMIT = 32 * 1024 * 1024;
+    private static final int CLIPBOARD_LIMIT = 2 * 1024 * 1024;
     private static final int RESPONSE_LIMIT = 8 * 1024 * 1024;
     private static final int INPUT_LIMIT = 4096;
     // Each provider authenticates only against its own API host.
@@ -260,13 +262,13 @@ public final class CraftActivity extends GameActivity {
                 ClipData.Item item = clip == null || clip.getItemCount() == 0 ? null : clip.getItemAt(0);
                 CharSequence plain = item == null ? null : item.getText();
                 String text = plain == null ? "" : plain.toString();
-                if (text.length() > HTTP_LIMIT) throw new IOException("Clipboard too large");
+                if (text.length() > CLIPBOARD_LIMIT) throw new IOException("Clipboard too large");
                 return new JSONObject().put("text", text).put("html", item == null || item.getHtmlText() == null ? "" : item.getHtmlText());
             }
             case "clipboard_set": {
                 String text = request.getString("text");
                 String html = request.optString("html");
-                if (text.length() > HTTP_LIMIT || html.length() > HTTP_LIMIT) throw new IOException("Clipboard too large");
+                if (text.length() > CLIPBOARD_LIMIT || html.length() > CLIPBOARD_LIMIT) throw new IOException("Clipboard too large");
                 runOnUiThread(() -> ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(html.isEmpty() ? ClipData.newPlainText("Craft", text) : ClipData.newHtmlText("Craft", text, html)));
                 return new JSONObject();
             }

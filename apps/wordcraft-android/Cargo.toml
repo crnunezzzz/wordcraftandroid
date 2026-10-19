@@ -13,6 +13,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 egui = { workspace = true }
 zeroize = { version = "1", features = ["derive"] }
+image = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { workspace = true, features = ["wgpu", "android-game-activity", "default_fonts"] }
