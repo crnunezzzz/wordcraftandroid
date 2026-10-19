@@ -1,5 +1,7 @@
 name: Publish signed Android APK
 on:
+  push:
+    branches: [android-apks]
   workflow_dispatch:
     inputs:
       tag:
@@ -17,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.binary_commit }}
+          ref: ${{ inputs.binary_commit || github.sha }}
           path: signed
       - name: Verify APK checksum and Android signature
         working-directory: signed
@@ -30,6 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_TAG: ${{ inputs.tag || 'android-v0.8.0-android.4' }}
         run: |
           gh release upload "$RELEASE_TAG" signed/WordCraft-Android-arm64.apk signed/WordCraft-Android-arm64.apk.sha256 --clobber
+          gh release edit "$RELEASE_TAG" --draft=false --latest
