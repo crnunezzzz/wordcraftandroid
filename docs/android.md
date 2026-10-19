@@ -62,3 +62,5 @@ La pestaña **Asistente**, junto a Ayuda, abre el panel lateral; el documento pe
 Las seis pruebas Rust de entrada/protocolo y las cuatro pruebas Java de InputConnection pasan. La comprobación Clippy de Android pasa con advertencias tratadas como errores. Las APK release ARM64 están firmadas y verificadas con apksigner y zipalign (16 KiB). Se revisaron capturas del editor con la pestaña Asistente en modo claro y oscuro.
 
 El CI general no está completamente verde en este entorno: fallan tres pruebas existentes de cobertura combinada tailandés/latín en fonts/layout. Formato, Clippy, assets, capas y WASM pasan; también pasa la prueba de posición y apertura de la pestaña Asistente. No se han cambiado esas pruebas de fuentes para ocultar el fallo.
+
+La publicación firmada puede ejecutarse con el workflow `Publish signed Android APK`: recibe un commit inmutable de la rama `android-apks` con la APK ya firmada y su SHA-256, verifica ambos y adjunta los archivos a una release existente. Esa rama contiene únicamente binarios públicos; las claves privadas de firma nunca se suben al repositorio.

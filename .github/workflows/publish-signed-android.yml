@@ -1,0 +1,35 @@
+name: Publish signed Android APK
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag
+        required: true
+        default: android-v0.8.0-android.4
+      binary_commit:
+        description: Immutable commit on the android-apks branch containing the verified signed APK
+        required: true
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.binary_commit }}
+          path: signed
+      - name: Verify APK checksum and Android signature
+        working-directory: signed
+        run: |
+          sha256sum --check WordCraft-Android-arm64.apk.sha256
+          signer=$(find "$ANDROID_HOME/build-tools" -name apksigner -type f | sort -V | tail -n 1)
+          test -n "$signer"
+          "$signer" verify --verbose WordCraft-Android-arm64.apk
+      - name: Attach the signed APK to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          gh release upload "$RELEASE_TAG" signed/WordCraft-Android-arm64.apk signed/WordCraft-Android-arm64.apk.sha256 --clobber
