@@ -1,6 +1,21 @@
 package ai.craft.mobile;
 
 import android.content.Intent;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.ColorFilter;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.Drawable;
+import android.os.Build;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.Window;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.net.Uri;
@@ -47,9 +62,14 @@ import java.util.zip.ZipOutputStream;
 public final class CraftActivity extends GameActivity {
     private EditorInputConnection editorConnection;
     private int pendingAccent;
-    private final ArrayBlockingQueue<JSONObject> inputEvents = new ArrayBlockingQueue<>(1024);
+    // Keys, IME edits and pointer events, in order. Guarded by itself.
+    private final ArrayDeque<JSONObject> inputEvents = new ArrayDeque<>();
     private static volatile CraftActivity current;
+    // Released whenever input or a platform event is queued; the native waker thread waits on it
+    // so the egui loop repaints at once instead of on its next timer tick.
+    private static final Semaphore wake = new Semaphore(0);
     private final ConcurrentLinkedQueue<JSONObject> events = new ConcurrentLinkedQueue<>();
+    private final BarsDrawable bars = new BarsDrawable();
     private final ExecutorService worker = Executors.newFixedThreadPool(2);
     private final ConcurrentHashMap<Long, HttpsURLConnection> requests = new ConcurrentHashMap<>();
     private final Set<Long> cancelled = ConcurrentHashMap.newKeySet();
@@ -62,13 +82,22 @@ public final class CraftActivity extends GameActivity {
     private static final int PICK = 4101;
     private static final int LIMIT = 128 * 1024 * 1024;
     private static final int HTTP_LIMIT = 2 * 1024 * 1024;
-    private static final Set<String> PROVIDERS = new HashSet<>(Arrays.asList("openai", "anthropic", "gemini", "openrouter", "xai", "mistral", "groq", "azure", "custom"));
+    private static final int RESPONSE_LIMIT = 8 * 1024 * 1024;
+    private static final int INPUT_LIMIT = 4096;
+    // Each provider authenticates only against its own API host.
+    private static final Map<String, String> PROVIDERS = new HashMap<>();
+    static {
+        PROVIDERS.put("openai", "api.openai.com");
+        PROVIDERS.put("anthropic", "api.anthropic.com");
+    }
     static { System.loadLibrary("wordcraft_android"); }
 
     @Override protected void onCreate(Bundle state) {
         current = this;
         super.onCreate(state);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        installWindowChrome();
+        installPointerInput();
         sync.scheduleWithFixedDelay(this::flushSaves, 1, 1, TimeUnit.SECONDS);
         importIntent(getIntent());
     }
@@ -94,7 +123,7 @@ public final class CraftActivity extends GameActivity {
         info.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
         info.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
         editorConnection = new EditorInputConnection(this, surface, info, new EditorInputConnection.Sink() {
-            public boolean event(JSONObject event) { return inputEvents.offer(event); }
+            public boolean event(JSONObject event) { return queueInput(event); }
             public boolean key(KeyEvent event) { return routeKey(event); }
         });
         editorConnection.setListener(this);
@@ -114,6 +143,14 @@ public final class CraftActivity extends GameActivity {
         if (editorConnection != null) editorConnection.setEditorInfo(getImeEditorInfo());
     }
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        // Back (gesture, button or mouse) never finishes the activity: the editor decides whether
+        // it closes a panel, a menu or sends the app to the background with the document intact.
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
+                try { queueInput(new JSONObject().put("type", "back")); } catch (org.json.JSONException ignored) { }
+            }
+            return true;
+        }
         return routeKey(event) || super.dispatchKeyEvent(event);
     }
     private boolean routeKey(KeyEvent event) {
@@ -138,7 +175,7 @@ public final class CraftActivity extends GameActivity {
             }
             text += new String(Character.toChars(unicode));
         }
-        try { inputEvents.offer(new JSONObject().put("type", "key").put("code", code).put("down", down)
+        try { queueInput(new JSONObject().put("type", "key").put("code", code).put("down", down)
             .put("repeat", event.getRepeatCount() > 0).put("meta", meta).put("text", text).put("altgr", altgr && !text.isEmpty())); }
         catch (org.json.JSONException ignored) { }
         // Wake the native event loop; Rust discards these duplicate native key events.
@@ -163,7 +200,7 @@ public final class CraftActivity extends GameActivity {
                     if (in == null) throw new IOException("No input stream");
                     Files.write(file.toPath(), readLimited(in, LIMIT));
                 }
-                events.add(new JSONObject().put("kind", "file").put("external", true).put("path", file.getAbsolutePath()));
+                post(new JSONObject().put("kind", "file").put("external", true).put("path", file.getAbsolutePath()));
             } catch (Exception e) { emitFileError(new JSONObject(), "No se pudo importar el archivo compartido por Android"); }
         });
     }
@@ -187,10 +224,12 @@ public final class CraftActivity extends GameActivity {
         String op = request.getString("op");
         if (op.equals("input")) {
             JSONArray batch = new JSONArray();
-            for (int i = 0; i < 1024; i++) {
-                JSONObject event = inputEvents.poll();
-                if (event == null) break;
-                batch.put(event);
+            synchronized (inputEvents) {
+                for (int i = 0; i < 1024; i++) {
+                    JSONObject event = inputEvents.pollFirst();
+                    if (event == null) break;
+                    batch.put(event);
+                }
             }
             return batch;
         }
@@ -206,6 +245,15 @@ public final class CraftActivity extends GameActivity {
                 return new JSONObject();
             }
             case "keys": return keyFlags();
+            case "chrome": {
+                int top = request.optInt("top", Color.WHITE), bottom = request.optInt("bottom", top);
+                boolean dark = request.optBoolean("dark");
+                runOnUiThread(() -> applyChrome(top, bottom, dark));
+                return new JSONObject();
+            }
+            case "minimize":
+                runOnUiThread(() -> moveTaskToBack(true));
+                return new JSONObject();
             case "clipboard_get": {
                 ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                 ClipData clip = clipboard.getPrimaryClip();
@@ -308,7 +356,7 @@ public final class CraftActivity extends GameActivity {
 
     private String provider(JSONObject request) throws Exception {
         String id = request.getString("provider");
-        if (!PROVIDERS.contains(id)) throw new IOException("Unknown provider");
+        if (!PROVIDERS.containsKey(id)) throw new IOException("Unknown provider");
         return id;
     }
 
@@ -323,7 +371,7 @@ public final class CraftActivity extends GameActivity {
 
     private JSONObject keyFlags() throws Exception {
         JSONObject flags = new JSONObject();
-        for (String id : PROVIDERS) flags.put(id, getSharedPreferences("vault", MODE_PRIVATE).contains(id));
+        for (String id : PROVIDERS.keySet()) flags.put(id, getSharedPreferences("vault", MODE_PRIVATE).contains(id));
         return flags;
     }
 
@@ -342,39 +390,50 @@ public final class CraftActivity extends GameActivity {
         HttpsURLConnection connection = null;
         try {
             event.put("kind", "http").put("ticket", request.getLong("ticket"));
-            if (cancelled.remove(request.getLong("ticket"))) throw new IOException("Cancelled");
+            if (cancelled.remove(request.getLong("ticket"))) throw new InterruptedIOException("Cancelled");
+            String provider = provider(request);
             URL url = new URL(request.getString("url"));
-            if (!url.getProtocol().equals("https") || url.getUserInfo() != null || url.getRef() != null) throw new IOException("HTTPS required");
+            if (!url.getProtocol().equals("https") || url.getUserInfo() != null || url.getRef() != null
+                || !url.getHost().equals(PROVIDERS.get(provider)) || (url.getPort() != -1 && url.getPort() != 443)) throw new IOException("HTTPS required");
+            String value;
+            try { value = key(provider); }
+            catch (Exception e) { event.put("error", "missing_key"); return; }
             connection = (HttpsURLConnection) url.openConnection();
             requests.put(request.getLong("ticket"), connection);
             connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(20_000); connection.setReadTimeout(90_000);
+            // Reasoning models can think for minutes before the first byte of a reply.
+            connection.setConnectTimeout(20_000); connection.setReadTimeout(300_000);
             connection.setRequestMethod("POST"); connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/json");
-            String api = request.getString("api");
-            String value = key(provider(request));
-            if (api.equals("anthropic")) {
+            if (provider.equals("anthropic")) {
                 connection.setRequestProperty("x-api-key", value);
                 connection.setRequestProperty("anthropic-version", "2023-06-01");
-            } else if (api.equals("gemini")) connection.setRequestProperty("x-goog-api-key", value);
-            else if (api.equals("azure")) connection.setRequestProperty("api-key", value);
-            else connection.setRequestProperty("Authorization", "Bearer " + value);
+                String beta = request.optString("beta");
+                if (beta.matches("[a-z0-9-]{1,64}(,[a-z0-9-]{1,64}){0,7}")) connection.setRequestProperty("anthropic-beta", beta);
+            } else connection.setRequestProperty("Authorization", "Bearer " + value);
             byte[] bytes = request.getJSONObject("body").toString().getBytes(StandardCharsets.UTF_8);
             if (bytes.length > HTTP_LIMIT) throw new IOException("Request too large");
             connection.setFixedLengthStreamingMode(bytes.length);
             try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
             int status = connection.getResponseCode();
-            if (status < 200 || status >= 300) {
-                String message = status == 401 || status == 403 ? "El proveedor rechazó la clave o su acceso al modelo" : status == 429 ? "Límite de uso o cuota del proveedor" : "El proveedor respondió HTTP " + status;
-                event.put("error", message);
-            } else {
-                try (InputStream in = connection.getInputStream()) { event.put("body", new JSONObject(new String(readLimited(in, HTTP_LIMIT), StandardCharsets.UTF_8))); }
+            event.put("status", status);
+            String retry = connection.getHeaderField("retry-after");
+            if (retry != null && retry.length() < 32) event.put("retry_after", retry);
+            boolean ok = status >= 200 && status < 300;
+            try (InputStream in = ok ? connection.getInputStream() : connection.getErrorStream()) {
+                String text = in == null ? "" : new String(readLimited(in, RESPONSE_LIMIT), StandardCharsets.UTF_8);
+                if (ok) event.put("body", new JSONObject(text));
+                else event.put("detail", text.length() > 6000 ? text.substring(0, 6000) : text);
             }
+        } catch (InterruptedIOException e) {
+            try { event.put("error", e instanceof java.net.SocketTimeoutException ? "timeout" : "cancelled"); } catch (Exception ignored) { }
+        } catch (java.net.UnknownHostException | java.net.ConnectException | javax.net.ssl.SSLException e) {
+            try { event.put("error", "offline"); } catch (Exception ignored) { }
         } catch (Exception e) {
-            try { event.put("error", "No se pudo consultar la API. Revisa la conexión, la clave, el endpoint y el modelo (" + e.getClass().getSimpleName() + ")."); } catch (Exception ignored) { }
+            try { event.put("error", "failed:" + e.getClass().getSimpleName()); } catch (Exception ignored) { }
         } finally {
             requests.remove(request.optLong("ticket")); cancelled.remove(request.optLong("ticket"));
-            if (connection != null) connection.disconnect(); events.add(event);
+            if (connection != null) connection.disconnect(); post(event);
         }
     }
 
@@ -395,7 +454,7 @@ public final class CraftActivity extends GameActivity {
         if (requestCode != PICK || pendingPicker == null) return;
         JSONObject request = pendingPicker; pendingPicker = null;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            try { events.add(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("cancelled", true)); } catch (Exception ignored) { }
+            try { post(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("cancelled", true)); } catch (Exception ignored) { }
             return;
         }
         Uri uri = data.getData();
@@ -430,7 +489,7 @@ public final class CraftActivity extends GameActivity {
                     }
                     event.put("path", file.getAbsolutePath()).put("name", file.getName());
                 }
-                events.add(event);
+                post(event);
             } catch (Exception e) { emitFileError(request, "No se pudo leer o exportar el archivo. Se conserva la copia local."); }
         });
     }
@@ -485,7 +544,7 @@ public final class CraftActivity extends GameActivity {
     }
 
     private void emitFileError(JSONObject request, String message) {
-        try { events.add(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("error", message)); } catch (Exception ignored) { }
+        try { post(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("error", message)); } catch (Exception ignored) { }
     }
     private void flushSaves() {
         for (Map.Entry<File, Uri> entry : saves.entrySet()) {
@@ -498,7 +557,7 @@ public final class CraftActivity extends GameActivity {
                 byte[] buffer = new byte[32 * 1024]; int size;
                 while ((size = in.read(buffer)) != -1) out.write(buffer, 0, size);
                 out.flush(); savedTimes.put(file, version);
-                events.add(new JSONObject().put("kind", "saved").put("exported", true));
+                post(new JSONObject().put("kind", "saved").put("exported", true));
             } catch (Exception e) {
                 saves.remove(file);
                 emitFileError(new JSONObject(), "No se pudo actualizar el destino Android. Tu archivo está guardado localmente; usa Exportar a Android.");
@@ -523,6 +582,140 @@ public final class CraftActivity extends GameActivity {
         };
         ((PrintManager) getSystemService(PRINT_SERVICE)).print("Craft", adapter, null);
     }
+    private void post(JSONObject event) {
+        events.add(event);
+        wake.release();
+    }
+
+    /** Called from the native waker thread: blocks until input or an event arrives (or timeout). */
+    public static boolean awaitEvents(int millis) {
+        try {
+            boolean woke = wake.tryAcquire(Math.max(1, Math.min(millis, 5000)), TimeUnit.MILLISECONDS);
+            wake.drainPermits();
+            return woke;
+        } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    /** Queues an input event for Rust. Consecutive moves of the same gesture collapse into the
+     *  latest one: their positions are absolute, so nothing is lost and a slow frame never
+     *  backs the queue up behind stale moves. */
+    private boolean queueInput(JSONObject event) {
+        synchronized (inputEvents) {
+            JSONObject last = inputEvents.peekLast();
+            if (last != null && event.optBoolean("coalesce") && last.optBoolean("coalesce")
+                && last.optInt("action") == event.optInt("action") && last.optInt("source") == event.optInt("source")
+                && last.optInt("count") == event.optInt("count") && last.optInt("cls") == event.optInt("cls")
+                && last.optInt("buttons") == event.optInt("buttons")) {
+                inputEvents.pollLast();
+            }
+            if (inputEvents.size() >= INPUT_LIMIT) return false;
+            inputEvents.addLast(event);
+        }
+        wake.release();
+        return true;
+    }
+
+    /** Draw edge to edge on every Android version and pad the editor by the system bars, the
+     *  display cutout and the keyboard. Android 15 enforces edge to edge for targetSdk 35, which
+     *  otherwise leaves the status and navigation bars over the ribbon and the status bar. */
+    private void installWindowChrome() {
+        Window window = getWindow();
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
+        }
+        if (mSurfaceView == null || !(mSurfaceView.getParent() instanceof View)) return;
+        View container = (View) mSurfaceView.getParent();
+        container.setBackground(bars);
+        ViewCompat.setOnApplyWindowInsetsListener(container, (view, insets) -> {
+            Insets system = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            view.setPadding(system.left, system.top, system.right, Math.max(system.bottom, ime.bottom));
+            bars.setTopInset(system.top);
+            // Not consumed: GameActivity still reads the keyboard's visibility from these insets.
+            return insets;
+        });
+        ViewCompat.requestApplyInsets(container);
+    }
+
+    private void applyChrome(int top, int bottom, boolean dark) {
+        bars.setColors(top | 0xff000000, bottom | 0xff000000);
+        getWindow().getDecorView().setBackgroundColor(bottom | 0xff000000);
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+        controller.setAppearanceLightStatusBars(!dark);
+        controller.setAppearanceLightNavigationBars(!dark);
+    }
+
+    /** Touch, stylus, mouse and touchpad reach Rust through the input queue; Rust recognises
+     *  taps, pans, long presses and pinches and turns them into editor events. GameActivity's
+     *  own listeners forwarded raw touches, which egui read as multi-touch zoom (the sudden
+     *  zooms) and as text selection instead of scrolling. */
+    private void installPointerInput() {
+        if (mSurfaceView == null) return;
+        mSurfaceView.setOnTouchListener((view, event) -> queuePointer(event));
+        mSurfaceView.setOnGenericMotionListener((view, event) -> queuePointer(event));
+    }
+
+    private boolean queuePointer(MotionEvent e) {
+        try {
+            int action = e.getActionMasked();
+            int count = Math.min(e.getPointerCount(), 10);
+            JSONArray pointers = new JSONArray();
+            for (int i = 0; i < count; i++) {
+                float x = e.getX(i), y = e.getY(i);
+                if (!Float.isFinite(x) || !Float.isFinite(y)) return true;
+                pointers.put(new JSONArray().put(e.getPointerId(i)).put((double) x).put((double) y).put(e.getToolType(i)));
+            }
+            int index = Math.min(e.getActionIndex(), Math.max(0, count - 1));
+            int classification = Build.VERSION.SDK_INT >= 29 ? e.getClassification() : 0;
+            JSONObject event = new JSONObject().put("type", "motion").put("action", action)
+                .put("id", count > 0 ? e.getPointerId(index) : 0).put("source", e.getSource())
+                .put("tool", count > 0 ? e.getToolType(index) : 0).put("buttons", e.getButtonState())
+                .put("action_button", e.getActionButton()).put("meta", e.getMetaState())
+                .put("time", e.getEventTime()).put("count", count).put("cls", classification).put("p", pointers);
+            if (action == MotionEvent.ACTION_SCROLL) {
+                float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL), h = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                event.put("vs", Float.isFinite(v) ? v : 0.0).put("hs", Float.isFinite(h) ? h : 0.0);
+            }
+            if (Build.VERSION.SDK_INT >= 34 && classification == MotionEvent.CLASSIFICATION_PINCH) {
+                float scale = e.getAxisValue(MotionEvent.AXIS_GESTURE_PINCH_SCALE_FACTOR);
+                event.put("pinch", Float.isFinite(scale) ? scale : 1.0);
+            }
+            event.put("coalesce", (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE)
+                && classification != 5);
+            queueInput(event);
+        } catch (org.json.JSONException ignored) { }
+        return true;
+    }
+
+    /** The window's background behind the status bar (top) and the navigation bar (bottom). */
+    private static final class BarsDrawable extends Drawable {
+        private final Paint paint = new Paint();
+        private int top = Color.WHITE, bottom = Color.WHITE, topInset;
+        void setColors(int top, int bottom) { this.top = top; this.bottom = bottom; invalidateSelf(); }
+        void setTopInset(int inset) { topInset = inset; invalidateSelf(); }
+        @Override public void draw(Canvas canvas) {
+            android.graphics.Rect r = getBounds();
+            paint.setColor(bottom);
+            canvas.drawRect(r, paint);
+            paint.setColor(top);
+            canvas.drawRect(r.left, r.top, r.right, r.top + Math.max(topInset, 0), paint);
+        }
+        @Override public void setAlpha(int alpha) { }
+        @Override public void setColorFilter(ColorFilter filter) { }
+        @Override public int getOpacity() { return PixelFormat.OPAQUE; }
+    }
+
     private static JSONObject error(String message) {
         JSONObject value = new JSONObject(); try { value.put("error", message); } catch (Exception ignored) { } return value;
     }

@@ -5170,6 +5170,7 @@ dependencies = [
  "android-activity",
  "eframe",
  "egui",
+ "egui_kittest",
  "jni",
  "serde",
  "serde_json",

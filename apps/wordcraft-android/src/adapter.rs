@@ -22,6 +22,8 @@ pub struct Editor {
 }
 impl Editor {
     pub const NAME: &'static str = "WordCraft";
+    /// The canvas coasts after a flick by itself (wheel phases), so the host must not.
+    pub const OWN_MOMENTUM: bool = true;
     pub fn new(dir: &Path, platform: Platform, ctx: &Context) -> Self {
         let _ = wordcraft_fonts::FontDb::global().load_user_fonts(&dir.join("fonts"));
         let pending: Pending = Rc::new(RefCell::new(HashMap::new()));
@@ -137,9 +139,6 @@ impl Editor {
             return json!({"error":e});
         }
         self.app.session.run("document.inspect", &json!({})).unwrap_or_else(|e| json!({"error":e.to_string()}))
-    }
-    pub fn stamp(&self) -> String {
-        format!("{}:{}:{:?}", self.app.session.document_id(), self.app.session.rev(), self.app.session.sel)
     }
     pub fn file_event(&mut self, event: &Value) {
         if event["external"] == true

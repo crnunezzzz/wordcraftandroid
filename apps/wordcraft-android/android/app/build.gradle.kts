@@ -7,8 +7,8 @@ android {
         applicationId = "ai.craft.wordcraft"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.8.0-android.5"
+        versionCode = 4
+        versionName = "0.8.0-android.6"
         ndk { abiFilters += "arm64-v8a" }
     }
     val craftKeystore = System.getenv("CRAFT_ANDROID_KEYSTORE")
