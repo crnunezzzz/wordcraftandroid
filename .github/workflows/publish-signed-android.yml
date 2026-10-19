@@ -7,7 +7,7 @@ on:
       tag:
         description: Existing release tag
         required: true
-        default: android-v0.8.0-android.4
+        default: android-v0.8.0-android.5
       binary_commit:
         description: Immutable commit on the android-apks branch containing the verified signed APK
         required: true
@@ -32,7 +32,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ inputs.tag || 'android-v0.8.0-android.4' }}
+          RELEASE_TAG: ${{ inputs.tag || 'android-v0.8.0-android.5' }}
         run: |
           gh release upload "$RELEASE_TAG" signed/WordCraft-Android-arm64.apk signed/WordCraft-Android-arm64.apk.sha256 --clobber
           gh release edit "$RELEASE_TAG" --draft=false --latest

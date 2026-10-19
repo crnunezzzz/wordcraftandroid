@@ -68,10 +68,17 @@ public final class CraftActivity extends GameActivity {
     @Override protected void onCreate(Bundle state) {
         current = this;
         super.onCreate(state);
-        if (editorConnection != null) setInputConnectionNative(getGameActivityNativeHandle(), editorConnection);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         sync.scheduleWithFixedDelay(this::flushSaves, 1, 1, TimeUnit.SECONDS);
         importIntent(getIntent());
+    }
+
+    // GameActivity supplies its live handle during onCreate. Its 4.4.0 public
+    // getter returns zero while alive; passing that value to JNI dereferences null.
+    // Replace the connection at the original binding point, before native input starts.
+    @Override protected void setInputConnectionNative(long handle, InputConnection connection) {
+        if (handle == 0) return;
+        super.setInputConnectionNative(handle, editorConnection != null ? editorConnection : connection);
     }
 
     @Override protected InputEnabledSurfaceView createSurfaceView() {

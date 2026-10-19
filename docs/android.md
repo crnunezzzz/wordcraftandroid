@@ -64,4 +64,12 @@ Las seis pruebas Rust de entrada/protocolo y las cuatro pruebas Java de InputCon
 El CI general no está completamente verde en este entorno: fallan tres pruebas existentes de cobertura combinada tailandés/latín en fonts/layout. Formato, Clippy, assets, capas y WASM pasan; también pasa la prueba de posición y apertura de la pestaña Asistente. No se han cambiado esas pruebas de fuentes para ocultar el fallo.
 
 La publicación firmada puede ejecutarse con el workflow `Publish signed Android APK`: recibe un commit inmutable de la rama `android-apks` con la APK ya firmada y su SHA-256, verifica ambos y adjunta los archivos a una release existente. Esa rama contiene únicamente binarios públicos; las claves privadas de firma nunca se suben al repositorio.
-La publicación también se activa al subir la rama `android-apks`; en ese caso verifica el mismo commit recibido y publica android.4.
+La publicación también se activa al subir la rama `android-apks`; en ese caso verifica el mismo commit recibido y publica android.5.
+
+## Corrección Android.5 — 2026-10-19
+
+Corrige el cierre nativo durante `CraftActivity.onCreate`: en GameActivity 4.4.0, `getGameActivityNativeHandle()` devuelve cero mientras la actividad está activa. La llamada adicional a `setInputConnectionNative` desreferenciaba ese cero. Ahora se sustituye la conexión mediante el punto de enlace original de GameActivity, conservando el identificador válido que entrega el ciclo de vida y rechazando identificadores nulos. No se modifica el diseño ni el procesamiento de texto.
+
+La regresión Java comprueba la conexión del editor con el identificador recibido, el rechazo de cero y la conexión nueva tras recrear la actividad. La prueba sustituye únicamente la biblioteca nativa; no equivale a una ejecución en la tablet. Android.5 incrementa versionCode a 3 y conserva la firma de android.4, por lo que se instala como actualización sin desinstalar ni borrar documentos.
+
+Validación: cinco pruebas Java por aplicación, compilación release ARM64, firma idéntica a android.4 y alineación ZIP de 16 KiB verificadas. GridCraft supera el CI completo. El CI general de WordCraft sigue bloqueado por cobertura de fuentes tailandés/latín; el de DeckCraft por la dependencia ALSA del ejecutable Linux. No se ha probado esta APK en una tablet física.
