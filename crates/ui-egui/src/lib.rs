@@ -56,6 +56,7 @@ pub mod file_browser;
 pub mod file_dialogs;
 pub mod frame;
 pub mod guides;
+pub mod host_toolbar;
 pub mod i18n;
 pub mod icons;
 pub mod ink;
@@ -95,6 +96,8 @@ pub use file_dialogs::{FileDialogAnswer, FileDialogRequest, open_filters};
 /// Platform services injected by the host (file dialogs, file I/O).
 #[derive(Default)]
 pub struct Services {
+    /// Optional platform commands presented beside Comments, using the editor's own chrome.
+    pub host_toolbar: Option<host_toolbar::HostToolbar>,
     /// Desktop: discover configured printers on a worker.
     pub printers: Option<printing::Discover>,
     /// Desktop: submit the PDF with the chosen settings on a worker.

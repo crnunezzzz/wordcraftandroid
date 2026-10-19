@@ -45,6 +45,8 @@ struct Agent {
 }
 
 pub struct Mobile {
+    input: crate::input::AndroidInput,
+    input_focus: Option<(Option<egui::Id>, bool)>,
     editor: Editor,
     platform: Platform,
     dir: PathBuf,
@@ -84,6 +86,8 @@ pub fn start(app: android_activity::AndroidApp) {
             let editor = Editor::new(&dir, platform.clone(), &cc.egui_ctx);
             let key_flags = platform.exchange(json!({"op":"keys"})).unwrap_or(json!({}));
             Ok(Box::new(Mobile {
+                input: Default::default(),
+                input_focus: None,
                 editor,
                 platform,
                 dir,
@@ -94,7 +98,7 @@ pub fn start(app: android_activity::AndroidApp) {
                 show_agent: false,
                 prompt: String::new(),
                 transcript: String::new(),
-                status: "Editas una copia local. Usa Exportar a Android para guardar fuera de la app.".into(),
+                status: String::new(),
                 agent: None,
                 next_ticket: 10_000,
                 last_poll: now(),
@@ -287,7 +291,6 @@ impl Mobile {
     }
 
     fn settings_ui(&mut self, ui: &mut Ui) {
-        ui.heading("Configuración de IA");
         ui.checkbox(&mut self.settings.enabled, "Activar asistente por API");
         ui.label("Cada solicitud envía tu instrucción, el contexto del documento y los resultados de las herramientas al proveedor elegido.");
         ui.checkbox(&mut self.settings.touch, "Controles amplios para uso táctil");
@@ -335,15 +338,6 @@ impl Mobile {
     }
 
     fn agent_ui(&mut self, ui: &mut Ui) {
-        ui.heading("Asistente");
-        let selected = self.settings.profiles.get(self.settings.active).map(|p| p.name.clone()).unwrap_or_default();
-        ui.add_enabled_ui(self.agent.is_none(), |ui| {
-            egui::ComboBox::from_id_salt("provider").selected_text(selected).show_ui(ui, |ui| {
-                for (i, p) in self.settings.profiles.iter().enumerate() {
-                    ui.selectable_value(&mut self.settings.active, i, &p.name);
-                }
-            });
-        });
         if !self.settings.enabled {
             ui.label("Activa el asistente y configura una clave en Configuración de IA.");
         }
@@ -382,6 +376,9 @@ impl eframe::App for Mobile {
         ctx.request_repaint_after(Duration::from_millis(150));
     }
     fn raw_input_hook(&mut self, _ctx: &Context, raw: &mut egui::RawInput) {
+        if let Ok(events) = self.platform.exchange(json!({"op":"input"})) {
+            self.input.append(&events, raw);
+        }
         let paste = raw
             .events
             .iter()
@@ -398,44 +395,83 @@ impl eframe::App for Mobile {
         }
     }
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        // Editors reapply their theme; adjust interaction sizes after their logic pass.
-        if self.settings.touch {
-            ui.style_mut().spacing.interact_size.y = 44.0;
-            ui.style_mut().spacing.button_padding = egui::vec2(10.0, 8.0);
-        }
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(Editor::NAME);
-            if ui.button("Editor").clicked() {
-                self.show_settings = false;
-                self.show_agent = false;
-            }
-            if ui.button("Asistente").clicked() {
-                self.show_agent = !self.show_agent;
-                self.show_settings = false;
-            }
-            if ui.button("Configurar IA").clicked() {
-                self.show_settings = !self.show_settings;
-                self.show_agent = false;
-                if !self.show_settings {
-                    for key in &mut self.keys {
-                        key.zeroize();
-                    }
+        self.editor.host_state(self.show_agent, self.agent.is_some(), &self.status);
+        if self.show_agent {
+            egui::Panel::right("android_assistant").default_size(340.0).min_size(260.0).max_size(520.0).resizable(true).show(ui, |ui| {
+                if self.settings.touch {
+                    ui.spacing_mut().interact_size.y = 32.0;
                 }
-            }
-            if ui.button("Exportar a Android").clicked() {
-                self.status = self.editor.export(&self.platform).err().unwrap_or_else(|| "Elige dónde guardar la copia".into());
-            }
-        });
-        if !self.status.is_empty() {
-            ui.label(&self.status);
+                ui.horizontal(|ui| {
+                    let selected = self
+                        .settings
+                        .profiles
+                        .get(self.settings.active)
+                        .map(|p| if p.model.is_empty() { p.name.clone() } else { p.model.chars().take(28).collect() })
+                        .unwrap_or_else(|| "Modelo".into());
+                    ui.menu_button(selected, |ui| {
+                        ui.set_max_width(280.0);
+                        ui.add_enabled_ui(self.agent.is_none(), |ui| {
+                            for (i, profile) in self.settings.profiles.iter().enumerate() {
+                                if ui.selectable_value(&mut self.settings.active, i, format!("{} · {}", profile.name, profile.model)).clicked() {
+                                    ui.close();
+                                }
+                            }
+                        });
+                        ui.separator();
+                        if ui.button("API keys y proveedores…").clicked() {
+                            self.show_settings = true;
+                            ui.close();
+                        }
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("×").on_hover_text("Cerrar asistente").clicked() {
+                            self.show_agent = false;
+                        }
+                    });
+                });
+                ui.separator();
+                if self.show_settings {
+                    if ui.button("‹ Volver a la conversación").clicked() {
+                        self.show_settings = false;
+                        self.persist();
+                    }
+                    egui::ScrollArea::vertical().id_salt("assistant_settings").show(ui, |ui| {
+                        self.settings_ui(ui);
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        if ui.button("Nueva conversación").clicked() && self.agent.is_none() {
+                            self.transcript.clear();
+                            self.prompt.clear();
+                        }
+                        ui.menu_button("⋯", |ui| {
+                            if ui.button("Configurar IA").clicked() {
+                                self.show_settings = true;
+                                ui.close();
+                            }
+                            if ui.button("Exportar una copia…").clicked() {
+                                self.status = self.editor.export(&self.platform).err().unwrap_or_else(|| "Elige dónde guardar la copia".into());
+                                ui.close();
+                            }
+                        });
+                    });
+                    self.agent_ui(ui);
+                }
+                if !self.status.is_empty() {
+                    ui.separator();
+                    ui.add(egui::Label::new(&self.status).wrap());
+                }
+            });
         }
-        ui.separator();
-        if self.show_settings {
-            egui::ScrollArea::vertical().show(ui, |ui| self.settings_ui(ui));
-        } else if self.show_agent {
-            self.agent_ui(ui);
-        } else {
-            self.editor.ui(ui);
+        self.editor.ui(ui);
+        match self.editor.host_action() {
+            Some("assistant") => self.show_agent = !self.show_agent,
+            Some("settings") => {
+                self.show_settings = true;
+                self.show_agent = true;
+            }
+            Some("export") => self.status = self.editor.export(&self.platform).err().unwrap_or_else(|| "Elige dónde guardar la copia".into()),
+            _ => {}
         }
         let copies: Vec<String> = ui.ctx().output(|out| {
             out.commands
@@ -461,8 +497,18 @@ impl eframe::App for Mobile {
         for url in links {
             let _ = self.platform.exchange(json!({"op":"open_url","url":url}));
         }
+        let ime = ui.ctx().output(|out| out.ime);
+        let focus = ime.map(|ime| (ui.ctx().memory(|m| m.focused()), ime.purpose == egui::IMEPurpose::Password));
+        if focus != self.input_focus || ime.is_some_and(|ime| ime.should_interrupt_composition) {
+            self.input.reset_composition();
+            let _ = self.platform.exchange(json!({"op":"input_context", "password":focus.is_some_and(|(_, password)| password)}));
+            self.input_focus = focus;
+        }
         let _ = self.platform.exchange(json!({"op":"frame_done"}));
-        if !self.show_settings {
+        if ui.ctx().output(|out| out.ime.is_some()) {
+            ui.ctx().request_repaint_after(Duration::from_millis(33));
+        }
+        if !self.show_settings || !self.show_agent {
             for key in &mut self.keys {
                 key.zeroize();
             }

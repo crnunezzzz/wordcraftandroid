@@ -26,7 +26,11 @@ fn main() {
     } else {
         wordcraft_engine::sample::sample_document()
     };
-    let mut app = WordApp::new(Session::new(doc), Services::default()).with_control(rx);
+    let mut services = Services::default();
+    if lines.first().is_some_and(|l| l.get("android").and_then(|v| v.as_bool()) == Some(true)) {
+        services.host_toolbar = Some(Default::default());
+    }
+    let mut app = WordApp::new(Session::new(doc), services).with_control(rx);
     app.integrated_titlebar = true;
     if lines.first().is_some_and(|l| l.get("startScreen").is_some()) {
         app.start_screen();

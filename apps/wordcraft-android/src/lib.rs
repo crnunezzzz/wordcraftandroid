@@ -3,6 +3,7 @@
 
 #[cfg(target_os = "android")]
 mod adapter;
+pub mod input;
 #[cfg(target_os = "android")]
 mod mobile;
 #[cfg(target_os = "android")]

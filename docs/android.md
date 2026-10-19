@@ -6,8 +6,8 @@ Estado: implementación inicial, 18 de octubre de 2026. APK independiente para A
 
 - Teclado y mouse: utiliza la cinta y los atajos actuales del editor. El host incorpora el portapapeles Android para texto y Ctrl+V.
 - Táctil: activa los controles amplios; GameActivity integra el teclado en pantalla y el IME. La cinta y los diálogos conservan su diseño de escritorio, adecuado sobre todo para tablets en horizontal.
-- Abrir importa una copia al almacenamiento privado de la app. Guardar conserva esa copia. **Exportar a Android** permite elegir un archivo externo mediante el selector del sistema. No se solicita acceso global al almacenamiento.
-- Configurar IA muestra las claves de los proveedores en una sola vista, siguiendo el gestor de claves de PDF Scholar: indicador de clave guardada, campo oculto para sustituirla, eliminación, endpoint y modelo. El proveedor activo se elige en Asistente.
+- Abrir importa una copia al almacenamiento privado de la app. Guardar conserva esa copia. **Asistente → ⋯ → Exportar una copia** permite elegir un archivo externo mediante el selector del sistema. No se solicita acceso global al almacenamiento.
+- Asistente → selector de modelo → API keys y proveedores muestra las claves de los proveedores en una sola vista, siguiendo el gestor de claves de PDF Scholar: indicador de clave guardada, campo oculto para sustituirla, eliminación, endpoint y modelo. El proveedor activo se elige en Asistente.
 - Activa el asistente, configura una clave propia y un modelo con herramientas, escribe la petición y pulsa Ejecutar. El modelo descubre los comandos reales y sus parámetros y los ejecuta en el documento abierto. Puedes detener la operación y deshacer los cambios con las herramientas del editor.
 
 ## IA y credenciales
@@ -29,7 +29,11 @@ export ANDROID_HOME=/ruta/al/android-sdk
 ./apps/wordcraft-android/build-apk.sh
 ```
 
-El script compila Rust con el perfil android (optimización 1, sin LTO), copia la biblioteca a jniLibs y genera una APK debug firmada para instalación local. Usa `CRAFT_ANDROID_PROFILE=release` para el motor con la optimización release habitual. La APK se encuentra en `apps/wordcraft-android/android/app/build/outputs/apk/debug/app-debug.apk`. Las bibliotecas nativas se enlazan con alineación de 16 KiB; se comprueba también el empaquetado con zipalign. La publicación de cada tag `android-v*` compila y adjunta la APK a GitHub Releases. Es una firma de desarrollo para instalación local, no una firma para Play Store.
+El script compila Rust con el perfil android (optimización 1, sin LTO), copia la biblioteca a jniLibs y genera una APK debug firmada para instalación local. Usa `CRAFT_ANDROID_PROFILE=release` para el motor con la optimización release habitual. La APK se encuentra en `apps/wordcraft-android/android/app/build/outputs/apk/debug/app-debug.apk`. Las bibliotecas nativas se enlazan con alineación de 16 KiB; se comprueba también el empaquetado con zipalign. Cada tag `android-v*` compila una APK release sin firmar como artefacto de Actions. Para distribuirla, se firma fuera del repositorio con una clave persistente y se adjunta manualmente a GitHub Releases. Nunca se publica el artefacto sin firmar como descarga instalable.
+
+Para generar una release firmada, configura `CRAFT_ANDROID_VARIANT=release`, `CRAFT_ANDROID_KEYSTORE` (ruta PKCS12, alias `craft`) y `CRAFT_ANDROID_KEYSTORE_PASSWORD` en el entorno de compilación. Conserva una copia privada de esa clave para futuras actualizaciones; no la incluyas en Git ni en los artefactos públicos.
+
+La versión android.3 usaba una firma debug temporal de Actions. Para pasar a android.4 hay que exportar primero los documentos locales, desinstalar la versión anterior e instalar la nueva. La desinstalación borra documentos privados y claves API; las copias exportadas permanecen fuera de la app. Las siguientes actualizaciones deben conservar la firma de android.4.
 
 ## Arquitectura y validación
 
@@ -46,3 +50,15 @@ El portapapeles Android incorpora texto y HTML; WordCraft y DeckCraft también r
 WordCraft usa su servicio de recuperación existente, que evita conservar copias en claro de documentos protegidos con contraseña. Su selector Guardar como también sincroniza la copia privada con el destino Android elegido mientras la actividad sigue abierta; un fallo conserva la copia local e informa del error.
 
 Android registra asociaciones Abrir con para los formatos de oficina principales. Se importan mediante URI con el permiso concedido por el sistema; cada importación está limitada a 128 MiB. Las imágenes del portapapeles se limitan a 32 MiB. Los enlaces web, correo y teléfono se delegan a las aplicaciones del sistema.
+
+## Corrección Android.4 — 2026-10-18
+
+La pestaña **Asistente**, junto a Ayuda, abre el panel lateral; el documento permanece visible. El selector reúne proveedores/modelos y acceso a sus API keys; la configuración se muestra dentro del mismo panel. Se elimina la franja externa de navegación y se usan los colores nativos en modo claro y oscuro. El icono del lanzador procede del recurso original de wordcraft.
+
+`EditorInputConnection` traduce composición, confirmación y borrado del teclado del sistema; los eventos Unicode y modificadores del teclado externo pasan por una cola explícita hasta egui, evitando duplicados de winit. Las pruebas de entrada Rust y Java cubren estos contratos; todavía se requiere validación física en la Xiaomi Pad 6. Para las pruebas Java: `cd apps/wordcraft-android/android && ./gradlew :app:testDebugUnitTest`.
+
+### Validación de esta actualización
+
+Las seis pruebas Rust de entrada/protocolo y las cuatro pruebas Java de InputConnection pasan. La comprobación Clippy de Android pasa con advertencias tratadas como errores. Las APK release ARM64 están firmadas y verificadas con apksigner y zipalign (16 KiB). Se revisaron capturas del editor con la pestaña Asistente en modo claro y oscuro.
+
+El CI general no está completamente verde en este entorno: fallan tres pruebas existentes de cobertura combinada tailandés/latín en fonts/layout. Formato, Clippy, assets, capas y WASM pasan; también pasa la prueba de posición y apertura de la pestaña Asistente. No se han cambiado esas pruebas de fuentes para ocultar el fallo.

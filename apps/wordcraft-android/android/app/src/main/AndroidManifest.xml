@@ -2,7 +2,7 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
-    <application android:label="WordCraft" android:theme="@style/CraftTheme" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
+    <application android:icon="@drawable/app_icon" android:roundIcon="@drawable/app_icon" android:label="WordCraft" android:theme="@style/CraftTheme" android:allowBackup="false" android:usesCleartextTraffic="false" android:supportsRtl="true">
         <activity android:name="ai.craft.mobile.CraftActivity" android:exported="true" android:launchMode="singleTask" android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation|uiMode|density" android:windowSoftInputMode="adjustResize">
             <meta-data android:name="android.app.lib_name" android:value="wordcraft_android" />
             <intent-filter>

@@ -11,6 +11,12 @@ import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyProperties;
 import android.util.Base64;
 import android.view.WindowManager;
+import android.view.KeyEvent;
+import android.view.KeyCharacterMap;
+import android.view.inputmethod.EditorInfo;
+import android.text.InputType;
+import com.google.androidgamesdk.gametextinput.GameTextInput;
+import com.google.androidgamesdk.gametextinput.InputConnection;
 import android.print.PrintManager;
 import android.print.PrintDocumentAdapter;
 import android.print.PrintDocumentInfo;
@@ -39,6 +45,9 @@ import java.util.zip.ZipOutputStream;
 
 /** Platform capabilities only; the editor and document tools run in Rust, in this process. */
 public final class CraftActivity extends GameActivity {
+    private EditorInputConnection editorConnection;
+    private int pendingAccent;
+    private final ArrayBlockingQueue<JSONObject> inputEvents = new ArrayBlockingQueue<>(1024);
     private static volatile CraftActivity current;
     private final ConcurrentLinkedQueue<JSONObject> events = new ConcurrentLinkedQueue<>();
     private final ExecutorService worker = Executors.newFixedThreadPool(2);
@@ -59,9 +68,75 @@ public final class CraftActivity extends GameActivity {
     @Override protected void onCreate(Bundle state) {
         current = this;
         super.onCreate(state);
+        if (editorConnection != null) setInputConnectionNative(getGameActivityNativeHandle(), editorConnection);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         sync.scheduleWithFixedDelay(this::flushSaves, 1, 1, TimeUnit.SECONDS);
         importIntent(getIntent());
+    }
+
+    @Override protected InputEnabledSurfaceView createSurfaceView() {
+        InputEnabledSurfaceView surface = new InputEnabledSurfaceView(this) {
+            @Override public boolean onCheckIsTextEditor() { return true; }
+            @Override public InputConnection onCreateInputConnection(EditorInfo out) {
+                if (editorConnection == null || !editorConnection.getSoftKeyboardActive()) return null;
+                if (out != null) GameTextInput.copyEditorInfo(editorConnection.getEditorInfo(), out);
+                return editorConnection;
+            }
+        };
+        EditorInfo info = getImeEditorInfo();
+        info.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
+        info.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
+        editorConnection = new EditorInputConnection(this, surface, info, new EditorInputConnection.Sink() {
+            public boolean event(JSONObject event) { return inputEvents.offer(event); }
+            public boolean key(KeyEvent event) { return routeKey(event); }
+        });
+        editorConnection.setListener(this);
+        surface.setOnKeyListener(editorConnection);
+        surface.setFocusable(true);
+        surface.setFocusableInTouchMode(true);
+        surface.requestFocus();
+        return surface;
+    }
+
+    @Override public void setImeEditorInfo(EditorInfo info) {
+        super.setImeEditorInfo(info);
+        if (editorConnection != null) editorConnection.setEditorInfo(info);
+    }
+    @Override public void setImeEditorInfoFields(int inputType, int action, int options) {
+        super.setImeEditorInfoFields(inputType, action, options);
+        if (editorConnection != null) editorConnection.setEditorInfo(getImeEditorInfo());
+    }
+    @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        return routeKey(event) || super.dispatchKeyEvent(event);
+    }
+    private boolean routeKey(KeyEvent event) {
+        int code = event.getKeyCode();
+        boolean handled = (code >= 7 && code <= 23) || (code >= 29 && code <= 77) || code == 81 || code == 92 || code == 93
+            || (code >= 111 && code <= 124) || (code >= 131 && code <= 163);
+        if (!handled) return false;
+        boolean down = event.getAction() == KeyEvent.ACTION_DOWN;
+        if (event.getAction() != KeyEvent.ACTION_DOWN && event.getAction() != KeyEvent.ACTION_UP) return false;
+        int meta = event.getMetaState();
+        boolean altgr = event.isCtrlPressed() && event.isAltPressed() && !event.isMetaPressed();
+        int unicode = down ? event.getUnicodeChar(altgr ? meta & ~KeyEvent.META_CTRL_MASK : meta) : 0;
+        String text = "";
+        if ((unicode & KeyCharacterMap.COMBINING_ACCENT) != 0) {
+            pendingAccent = unicode & KeyCharacterMap.COMBINING_ACCENT_MASK;
+        } else if (unicode > 0 && Character.isValidCodePoint(unicode)) {
+            if (pendingAccent != 0) {
+                int combined = KeyCharacterMap.getDeadChar(pendingAccent, unicode);
+                if (combined != 0) unicode = combined;
+                else text = new String(Character.toChars(pendingAccent));
+                pendingAccent = 0;
+            }
+            text += new String(Character.toChars(unicode));
+        }
+        try { inputEvents.offer(new JSONObject().put("type", "key").put("code", code).put("down", down)
+            .put("repeat", event.getRepeatCount() > 0).put("meta", meta).put("text", text).put("altgr", altgr && !text.isEmpty())); }
+        catch (org.json.JSONException ignored) { }
+        // Wake the native event loop; Rust discards these duplicate native key events.
+        if (down) super.onKeyDown(code, event); else super.onKeyUp(code, event);
+        return true;
     }
 
     @Override protected void onNewIntent(Intent intent) {
@@ -103,7 +178,26 @@ public final class CraftActivity extends GameActivity {
 
     private Object dispatch(JSONObject request) throws Exception {
         String op = request.getString("op");
+        if (op.equals("input")) {
+            JSONArray batch = new JSONArray();
+            for (int i = 0; i < 1024; i++) {
+                JSONObject event = inputEvents.poll();
+                if (event == null) break;
+                batch.put(event);
+            }
+            return batch;
+        }
         switch (op) {
+            case "input_context": {
+                boolean password = request.optBoolean("password");
+                runOnUiThread(() -> {
+                    if (editorConnection != null) {
+                        editorConnection.resetContext(password);
+                        ((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE)).restartInput(mSurfaceView);
+                    }
+                });
+                return new JSONObject();
+            }
             case "keys": return keyFlags();
             case "clipboard_get": {
                 ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);

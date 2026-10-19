@@ -65,6 +65,7 @@ impl Editor {
         let mut app = WordApp::new(
             session,
             Services {
+                host_toolbar: Some(Default::default()),
                 file_dialog: Some(hook),
                 clipboard_html: Some(Box::new(move || html_clipboard.clipboard("html"))),
                 set_clipboard_html: Some(Box::new(move |html, text, _mathml| copy_clipboard.copy_html(html, text).is_ok())),
@@ -97,6 +98,16 @@ impl Editor {
     }
     pub fn ui(&mut self, ui: &mut Ui) {
         self.app.ui(ui);
+    }
+    pub fn host_state(&mut self, open: bool, busy: bool, status: &str) {
+        if let Some(host) = &mut self.app.services.host_toolbar {
+            host.assistant_open = open;
+            host.busy = busy;
+            host.status = status.into();
+        }
+    }
+    pub fn host_action(&mut self) -> Option<&'static str> {
+        self.app.services.host_toolbar.as_mut()?.action.take()
     }
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         self.app.run(id, params)

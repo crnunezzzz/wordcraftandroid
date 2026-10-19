@@ -21,5 +21,9 @@ cp "${CARGO_TARGET_DIR:-$repo_dir/target}/aarch64-linux-android/$native_profile/
 cp "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$(basename -- "$(dirname -- "$ndk_bin")")/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" "$native_dir/"
 "$ndk_bin/llvm-strip" --strip-unneeded "$native_dir/libwordcraft_android.so" "$native_dir/libc++_shared.so"
 cd "$app_dir/android"
-./gradlew --no-daemon assembleDebug
-printf '%s\n' "$app_dir/android/app/build/outputs/apk/debug/app-debug.apk"
+case "${CRAFT_ANDROID_VARIANT:-debug}" in
+    debug) ./gradlew --no-daemon assembleDebug; variant=debug ;;
+    release) ./gradlew --no-daemon assembleRelease; variant=release ;;
+    *) printf '%s\n' 'CRAFT_ANDROID_VARIANT must be debug or release' >&2; exit 2 ;;
+esac
+printf '%s\n' "$app_dir/android/app/build/outputs/apk/$variant/app-$variant*.apk"
