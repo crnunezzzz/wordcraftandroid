@@ -19,6 +19,7 @@ use crate::{
     assistant::{Action, Assistant, Branding, Busy, COMPOSER_ID, Chip, Entry, Host, PlanInfo, Settings, Step, View, plan_index},
     attach::{self, Attachment},
     protocol::{self, Degrade, Provider, Thread},
+    update::{self, Release},
 };
 use egui::Context;
 use serde_json::Value;
@@ -88,6 +89,7 @@ pub struct Desktop {
     replies: (Sender<(u64, Value)>, Receiver<(u64, Value)>),
     prepared: (Sender<Prepared>, Receiver<Prepared>),
     checks: (Sender<(Provider, PlanInfo)>, Receiver<(Provider, PlanInfo)>),
+    updates: (Sender<Result<Option<Release>, String>>, Receiver<Result<Option<Release>, String>>),
     /// The system's display scale (native pixels per point).
     native: f32,
     was_settings: bool,
@@ -120,6 +122,7 @@ impl Desktop {
             replies: mpsc::channel(),
             prepared: mpsc::channel(),
             checks: mpsc::channel(),
+            updates: mpsc::channel(),
             native: 1.0,
             was_settings: false,
             plan_programs: [None, None],
@@ -166,6 +169,23 @@ impl Desktop {
                 std::thread::sleep(Duration::from_secs(4));
             }
         });
+    }
+
+    /// Look for a newer published build off the UI thread.
+    fn check_update(&mut self) {
+        let Some(url) = update::api_url(update::repo(crate::RELEASES)) else { return };
+        self.assistant.update_checking = true;
+        self.assistant.settings.update_checked = unix_now();
+        self.save_settings();
+        let tx = self.updates.0.clone();
+        let spawned = std::thread::Builder::new().name("craft-update-check".into()).spawn(move || {
+            let result =
+                http::releases(&url).map(|reply| update::latest(&reply, update::repo(crate::RELEASES), update::Target::Windows, update::build()));
+            let _ = tx.send(result);
+        });
+        if spawned.is_err() {
+            self.assistant.update_result(Err(update::failure(None)));
+        }
     }
 
     fn save_settings(&mut self) {
@@ -226,6 +246,12 @@ impl Desktop {
         while let Ok((provider, info)) = self.checks.1.try_recv() {
             self.assistant.plans[plan_index(provider)] = info;
         }
+        while let Ok(result) = self.updates.1.try_recv() {
+            self.assistant.update_result(result);
+        }
+        if self.assistant.update_due(unix_now()) {
+            self.check_update();
+        }
         // Opening the settings checks the chosen plans again (the user may have signed in).
         let settings = self.assistant.open && self.assistant.view == View::Settings;
         if settings && !self.was_settings {
@@ -254,6 +280,7 @@ impl Desktop {
     /// After the editor's UI: what the panel asked for. (The ribbon's Asistente tab opens it; the
     /// floating button is for touch screens.)
     pub fn finish(&mut self, ctx: &Context, editor: &mut dyn Editor) {
+        self.assistant.update_notice(ctx, self.brand);
         let actions = self.assistant.take_actions();
         self.act(actions, ctx, editor);
         if !self.assistant.open || self.assistant.view != View::Settings {
@@ -353,6 +380,28 @@ impl Desktop {
                         if self.assistant.settings.plan(provider) {
                             self.check(provider, Duration::ZERO);
                         }
+                    }
+                }
+                Action::CheckUpdate => {
+                    self.assistant.settings.update_skipped = 0;
+                    if !self.assistant.update_checking {
+                        self.check_update();
+                    }
+                }
+                Action::OpenUpdate => {
+                    if let Some(release) = &self.assistant.update {
+                        let build = release.build;
+                        if let Err(e) = open::that_detached(&release.download) {
+                            self.assistant.update_status = Some(format!("No se pudo abrir el navegador ({e}). Descárgala desde {}", release.page));
+                        }
+                        self.assistant.settings.update_skipped = build;
+                        self.save_settings();
+                    }
+                }
+                Action::SkipUpdate => {
+                    if let Some(release) = &self.assistant.update {
+                        self.assistant.settings.update_skipped = release.build;
+                        self.save_settings();
                     }
                 }
                 Action::Attach => self.attach(),
@@ -720,6 +769,12 @@ impl Desktop {
     }
 }
 
+// Only when the last update check was (desktop: never wasm).
+#[allow(clippy::disallowed_methods)]
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
 fn push_steps(entries: &mut Vec<Entry>, steps: Vec<Step>) {
     if let Some(Entry::Steps(previous)) = entries.last_mut() {
         previous.extend(steps);
@@ -796,11 +851,11 @@ print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "re
         for _ in 0..400 {
             desktop.frame(ctx, editor);
             if desktop.plan.is_none() {
-                return;
+                break;
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        panic!("the plan run did not end");
+        assert!(desktop.plan.is_none(), "the plan run did not end");
     }
 
     #[test]

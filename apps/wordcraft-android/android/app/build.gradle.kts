@@ -7,8 +7,9 @@ android {
         applicationId = "ai.craft.wordcraft"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.8.0-android.7"
+        // The release workflow numbers its builds so each one installs over the last.
+        versionCode = System.getenv("CRAFT_ANDROID_VERSION_CODE")?.toIntOrNull() ?: 5
+        versionName = System.getenv("CRAFT_ANDROID_VERSION_NAME") ?: "0.8.0-android.7"
         ndk { abiFilters += "arm64-v8a" }
     }
     val craftKeystore = System.getenv("CRAFT_ANDROID_KEYSTORE")

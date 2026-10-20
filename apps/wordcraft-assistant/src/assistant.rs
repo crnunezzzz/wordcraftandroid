@@ -6,6 +6,7 @@
 use crate::{
     attach::Attachment,
     protocol::{self, MODELS, Provider},
+    update::{self, Release},
 };
 use egui::{
     Align, Align2, Color32, Context, CornerRadius, Frame, Key, Layout, Margin, Pos2, Rect, RichText, Sense, Shape, Stroke, TextureHandle, Ui, Vec2,
@@ -36,10 +37,25 @@ pub struct Settings {
     pub openai_plan: bool,
     /// Desktop: Claude through the user's Claude plan (their own Claude Code CLI).
     pub anthropic_plan: bool,
+    /// Look for new builds of this app now and then (the fork's GitHub releases).
+    pub updates: bool,
+    /// The build the user answered «Ahora no» to: no notice until a newer one.
+    pub update_skipped: u64,
+    /// When the last check started (Unix seconds).
+    pub update_checked: u64,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { ai: true, model: String::new(), effort: "medium".into(), openai_plan: false, anthropic_plan: false }
+        Self {
+            ai: true,
+            model: String::new(),
+            effort: "medium".into(),
+            openai_plan: false,
+            anthropic_plan: false,
+            updates: true,
+            update_skipped: 0,
+            update_checked: 0,
+        }
     }
 }
 impl Settings {
@@ -138,6 +154,12 @@ pub enum Action {
     PlanInstall(Provider),
     /// Desktop: check again whether the plan tools are installed and signed in.
     PlanRefresh,
+    /// Look for a new build now (from the settings).
+    CheckUpdate,
+    /// Open the new build's file in the browser.
+    OpenUpdate,
+    /// «Ahora no»: no notice for this build.
+    SkipUpdate,
 }
 
 /// Work in progress, as the host reports it each frame.
@@ -170,6 +192,13 @@ pub struct Assistant {
     pub prompt: String,
     pub entries: Vec<Entry>,
     pub busy: Option<Busy>,
+    /// This build's number from the release workflow (0: a local build).
+    pub build: u64,
+    /// A newer published build, as the host's last check found it.
+    pub update: Option<Release>,
+    pub update_checking: bool,
+    /// The last check's outcome, for the settings.
+    pub update_status: Option<String>,
     actions: Vec<Action>,
     composer_height: f32,
 }
@@ -485,7 +514,81 @@ pub fn plan_index(provider: Provider) -> usize {
 
 impl Assistant {
     pub fn new(settings: Settings) -> Self {
-        Self { settings, ui_scale: 1.0, ..Default::default() }
+        Self { settings, ui_scale: 1.0, build: update::build(), ..Default::default() }
+    }
+
+    /// Whether the host should look for a new build now (`now` in Unix seconds).
+    pub fn update_due(&self, now: u64) -> bool {
+        self.settings.updates && !self.update_checking && now.saturating_sub(self.settings.update_checked) >= update::EVERY_SECS
+    }
+
+    /// The host's check finished: `Ok(None)` means no newer build is published.
+    pub fn update_result(&mut self, result: Result<Option<Release>, String>) {
+        self.update_checking = false;
+        match result {
+            Ok(Some(release)) => {
+                self.update_status = Some(format!("Hay una versión nueva: {} (compilación {}).", release.version, release.build));
+                self.update = Some(release);
+            }
+            Ok(None) => {
+                self.update = None;
+                self.update_status = Some("Tienes la versión más reciente.".into());
+            }
+            Err(e) => self.update_status = Some(e),
+        }
+    }
+
+    /// The notice for a new build, over the editor (drawn whether or not the panel is open).
+    pub fn update_notice(&mut self, ctx: &Context, brand: &Branding) {
+        let Some(release) = &self.update else { return };
+        if release.build == self.settings.update_skipped {
+            return;
+        }
+        let desktop = self.host == Host::Desktop;
+        let screen = ctx.content_rect();
+        let width = (screen.width() - 32.0).clamp(200.0, 380.0);
+        let lift = if desktop { 48.0 } else { 128.0 };
+        let mut chosen = None;
+        egui::Area::new(egui::Id::new("assistant_update")).order(egui::Order::Foreground).anchor(Align2::LEFT_BOTTOM, vec2(16.0, -lift)).show(
+            ctx,
+            |ui| {
+                own_fonts(ui);
+                let palette = Palette::of(ui);
+                Frame::new()
+                    .fill(palette.bg)
+                    .stroke(Stroke::new(1.0, palette.border))
+                    .corner_radius(14)
+                    .inner_margin(Margin::same(14))
+                    .shadow(egui::Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(50) })
+                    .show(ui, |ui| {
+                        ui.set_width(width - 28.0);
+                        let name = if desktop { format!("{} IA", brand.name) } else { brand.name.to_owned() };
+                        ui.label(RichText::new(format!("Hay una versión nueva de {name}")).strong().size(15.5).color(palette.strong));
+                        ui.add_space(4.0);
+                        let how = if desktop {
+                            "Descarga el zip y ejecuta install-ia.ps1: tus ajustes y claves se conservan."
+                        } else {
+                            "Descarga la APK y ábrela para instalarla encima: tus documentos, ajustes y claves se conservan."
+                        };
+                        let text = format!("Versión {}, compilación {}. {how}", release.version, release.build);
+                        ui.add(egui::Label::new(RichText::new(text).color(palette.text)).wrap());
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            let download = egui::Button::new(RichText::new("Descargar").color(palette.on_accent).strong())
+                                .fill(palette.accent)
+                                .corner_radius(10)
+                                .min_size(vec2(112.0, 36.0));
+                            if ui.add(download).clicked() {
+                                chosen = Some(Action::OpenUpdate);
+                            }
+                            if ui.add(egui::Button::new("Ahora no").corner_radius(10).min_size(vec2(96.0, 36.0))).clicked() {
+                                chosen = Some(Action::SkipUpdate);
+                            }
+                        });
+                    });
+            },
+        );
+        self.actions.extend(chosen);
     }
 
     pub fn has_key(&self, provider: Provider) -> bool {
@@ -791,6 +894,7 @@ impl Assistant {
             if self.host == Host::Android {
                 note(ui, "Un dedo desplaza la página · tocar = clic · mantener = menú contextual · mantener y arrastrar = seleccionar · dos dedos = zoom. Ratón, lápiz y trackpad funcionan como en el escritorio; Atrás cierra paneles y menús.");
             }
+            self.updates_section(ui, palette);
             ui.add_space(18.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let done = egui::Button::new(RichText::new("Listo").color(palette.on_accent).strong()).fill(palette.accent).corner_radius(12).min_size(vec2(104.0, 42.0));
@@ -800,6 +904,48 @@ impl Assistant {
                 }
             });
             ui.add_space(12.0);
+        });
+    }
+
+    fn updates_section(&mut self, ui: &mut Ui, palette: &Palette) {
+        ui.add_space(16.0);
+        ui.label(RichText::new("Actualizaciones").strong().size(15.0).color(palette.strong));
+        ui.add_space(6.0);
+        let before = self.settings.updates;
+        egui::ComboBox::from_id_salt("updates")
+            .width(ui.available_width())
+            .selected_text(if self.settings.updates { "Avisar de versiones nuevas" } else { "No buscar versiones nuevas" })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.settings.updates, true, "Avisar de versiones nuevas");
+                ui.selectable_value(&mut self.settings.updates, false, "No buscar versiones nuevas");
+            });
+        if before != self.settings.updates {
+            self.actions.push(Action::SaveSettings);
+        }
+        ui.add_space(4.0);
+        let this = if self.build == 0 {
+            "Esta copia se compiló a mano (sin número).".to_owned()
+        } else {
+            format!("Esta copia es la compilación {}.", self.build)
+        };
+        let what = if self.host == Host::Desktop { "el zip para Windows" } else { "la APK" };
+        let text = format!(
+            "{this} Dos veces al día se consulta la lista de versiones publicadas en GitHub; no se envía nada tuyo. Si hay una nueva, aparece un aviso para descargar {what}."
+        );
+        ui.add(egui::Label::new(RichText::new(text).color(palette.weak)).wrap());
+        if let Some(status) = &self.update_status {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(status).color(palette.text)).wrap());
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            let label = if self.update_checking { "Buscando…" } else { "Buscar ahora" };
+            if ui.add_enabled(!self.update_checking, egui::Button::new(label).corner_radius(10).min_size(vec2(120.0, 32.0))).clicked() {
+                self.actions.push(Action::CheckUpdate);
+            }
+            if self.update.is_some() && ui.add(egui::Button::new("Descargar").corner_radius(10).min_size(vec2(110.0, 32.0))).clicked() {
+                self.actions.push(Action::OpenUpdate);
+            }
         });
     }
 

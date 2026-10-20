@@ -9,6 +9,10 @@ pub mod attach;
 #[cfg(not(any(target_os = "android", target_arch = "wasm32")))]
 pub mod desktop;
 pub mod protocol;
+pub mod update;
+
+/// Where this fork publishes its builds (the workflow's own repository takes precedence).
+pub const RELEASES: &str = "crnunezzzz/wordcraftandroid";
 
 /// The assistant's texts for this app.
 pub const BRANDING: assistant::Branding = assistant::Branding {

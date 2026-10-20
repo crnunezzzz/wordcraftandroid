@@ -9,7 +9,7 @@ mod mobile;
 #[cfg(target_os = "android")]
 mod platform;
 // The panel, protocols and texts are shared with the desktop app.
-pub use wordcraft_assistant::{BRANDING, assistant, attach, protocol};
+pub use wordcraft_assistant::{BRANDING, RELEASES, assistant, attach, protocol, update};
 
 // android-activity requires this exact exported Rust ABI symbol. No unsafe operations occur
 // here or in the platform bridge; JNI uses checked calls and JavaVM::singleton().

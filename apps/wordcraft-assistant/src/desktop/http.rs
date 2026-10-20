@@ -76,6 +76,30 @@ pub fn send(request: &Value, key: &str) -> Value {
     }
 }
 
+/// GitHub's list of this app's releases (blocking: call from a worker thread). Only GitHub's
+/// API is reached; no key or personal data is sent.
+pub fn releases(url: &str) -> Result<Value, String> {
+    if !url.starts_with("https://api.github.com/repos/") {
+        return Err(crate::update::failure(None));
+    }
+    let tls = ureq::tls::TlsConfig::builder().root_certs(ureq::tls::RootCerts::PlatformVerifier).build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .tls_config(tls)
+        .http_status_as_error(false)
+        .timeout_connect(Some(Duration::from_secs(15)))
+        .timeout_global(Some(Duration::from_secs(60)))
+        .build()
+        .into();
+    let call = agent.get(url).header("accept", "application/vnd.github+json").header("user-agent", "craft-ia-updates");
+    let mut response = call.call().map_err(|_| crate::update::failure(None))?;
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(crate::update::failure(Some(status)));
+    }
+    let text = response.body_mut().with_config().limit(crate::update::MAX_REPLY as u64).read_to_string().map_err(|_| crate::update::failure(None))?;
+    serde_json::from_str(&text).map_err(|_| crate::update::failure(Some(502)))
+}
+
 /// Beta header values are a short list of lowercase names (as the Android bridge checks).
 fn valid_beta(beta: &str) -> bool {
     let names: Vec<&str> = beta.split(',').collect();

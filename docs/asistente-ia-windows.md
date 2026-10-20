@@ -1,7 +1,8 @@
 # WordCraft IA para Windows
 
 > Estado · 2026-10-20: primera versión de escritorio del asistente (Windows x64; también compila en
-> macOS y Linux). Las pruebas automáticas pasan; falta probarla a mano en un PC con Windows.
+> macOS y Linux), con aviso de versiones nuevas en Windows y Android. Las pruebas automáticas
+> pasan; falta probarla a mano en un PC con Windows.
 
 WordCraft IA es WordCraft con el asistente de IA de la versión Android, en el escritorio. El
 asistente se abre desde la pestaña **Asistente** de la cinta. Lee el documento abierto y lo edita
@@ -57,15 +58,31 @@ los sobrescribiría. Por eso WordCraft IA:
 2. **Recibe las mejoras del proyecto original** con el workflow
    [`ia-windows.yml`](../.github/workflows/ia-windows.yml). Cada día fusiona
    `storytold/wordcraft` en `main`, prueba el asistente sobre el código fusionado y publica una
-   versión nueva en *Releases*. Si el proyecto original cambia las mismas líneas que este fork,
+   versión nueva en *Releases*: el zip de Windows y la APK firmada de Android en la misma
+   versión. Si el proyecto original cambia las mismas líneas que este fork,
    no se publica nada: el workflow abre un issue y la última versión sigue disponible.
 3. **Toca lo mínimo del código original**, para que esas fusiones casi nunca choquen:
    - todo el asistente vive en `apps/wordcraft-assistant` (compartido con Android);
    - la app de escritorio solo añade `apps/wordcraft/src/assistant_host.rs` y unas pocas líneas
      en `main.rs`.
 
-Para actualizar: descarga el zip de la última versión en *Releases* y vuelve a ejecutar
-`install-ia.ps1`.
+### Aviso de versión nueva
+
+Las dos apps (Windows y Android) consultan dos veces al día la lista pública de versiones del
+repositorio en GitHub. No se envía nada del usuario: es la misma lista que se ve en *Releases*.
+Si hay una compilación más nueva que la instalada, aparece el aviso «Hay una versión nueva» con
+**Descargar** (abre el archivo en el navegador) y **Ahora no** (no vuelve a avisar de esa
+compilación). En el asistente › engranaje › **Actualizaciones** se puede desactivar el aviso o
+buscar al momento.
+
+- **Windows:** descarga el zip, descomprímelo y vuelve a ejecutar `install-ia.ps1`.
+- **Android:** abre la APK descargada para instalarla encima. Android pide una vez permiso para
+  instalar apps desde el navegador. Se conservan documentos, ajustes y claves porque todas las
+  APK llevan la misma firma.
+
+Cada compilación del workflow lleva su número (`CRAFT_IA_BUILD`) y su repositorio
+(`CRAFT_IA_REPO`); una compilación hecha a mano tiene el número 0, así que avisa de la primera
+versión publicada. El código está en `apps/wordcraft-assistant/src/update.rs`.
 
 ### Ajustes del repositorio
 
@@ -73,6 +90,10 @@ Para actualizar: descarga el zip de la última versión en *Releases* y vuelve a
 - Recomendado: crea el secreto **SYNC_TOKEN**, un token personal con los permisos `repo` y
   `workflow`. Sin él, GitHub impide que el workflow suba una fusión en la que el proyecto
   original cambió sus propios workflows. En ese caso se abre un issue avisándolo.
+- Para la APK de Android: crea los secretos **ANDROID_KEYSTORE_BASE64** (el archivo
+  `craft-release.p12` en base64) y **ANDROID_KEYSTORE_PASSWORD** (su contraseña). Tiene que ser la
+  misma clave con la que se firmaron las APK que ya tienes instaladas; si no, Android no deja
+  instalar encima. Sin estos secretos, la versión solo trae el zip de Windows.
 - Para publicar una versión al momento: *Actions* › «IA Windows» › *Run workflow*.
 
 ## Desarrollo

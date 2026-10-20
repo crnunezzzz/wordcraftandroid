@@ -25,6 +25,8 @@ getrandom = { workspace = true }
 # The attachment picker and pasted pictures (already in the desktop app's build).
 rfd = { workspace = true }
 pollster = "0.4"
+# «Descargar» on a new build opens its file in the browser.
+open = "5"
 arboard = { workspace = true, features = ["image-data"] }
 
 # API keys live in the system's own credential store (Credential Manager, Keychain).

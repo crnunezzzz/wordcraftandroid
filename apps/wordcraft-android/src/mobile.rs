@@ -6,6 +6,7 @@ use crate::{
     attach::{self, Attachment},
     platform::Platform,
     protocol::{self, Degrade, Thread},
+    update,
 };
 use egui::{Color32, Context, Key, Ui};
 use serde_json::{Value, json};
@@ -20,6 +21,11 @@ use zeroize::Zeroize;
 #[allow(clippy::disallowed_methods)]
 fn now() -> Instant {
     Instant::now()
+}
+
+#[allow(clippy::disallowed_methods)]
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
 type Prepared = Result<Attachment, String>;
@@ -55,6 +61,8 @@ pub struct Mobile {
     attach_ticket: Option<u64>,
     /// Attachments prepared off the UI thread.
     prepared: (Sender<Prepared>, Receiver<Prepared>),
+    /// The check for a new build in flight (Java fetches GitHub's release list).
+    update_ticket: Option<u64>,
 }
 
 pub fn start(app: android_activity::AndroidApp) {
@@ -103,6 +111,7 @@ pub fn start(app: android_activity::AndroidApp) {
                 native: 1.0,
                 attach_ticket: None,
                 prepared: mpsc::channel(),
+                update_ticket: None,
             }))
         }),
     );
@@ -121,6 +130,28 @@ impl Mobile {
             self.status = e;
         }
         self.editor.persist(&self.dir);
+    }
+
+    /// Look for a newer published build (Java fetches the list; the reply arrives in `poll`).
+    fn check_update(&mut self) {
+        self.next_ticket = self.next_ticket.saturating_add(1);
+        let ticket = self.next_ticket;
+        self.assistant.update_checking = true;
+        self.assistant.settings.update_checked = unix_now();
+        self.save_settings();
+        match self.platform.exchange(json!({"op":"update_check","ticket":ticket,"repo":update::repo(crate::RELEASES)})) {
+            Ok(_) => self.update_ticket = Some(ticket),
+            Err(_) => self.assistant.update_result(Err(update::failure(None))),
+        }
+    }
+
+    fn update_reply(&mut self, event: &Value) {
+        let result = match event["status"].as_u64() {
+            Some(200) => Ok(update::latest(&event["body"], update::repo(crate::RELEASES), update::Target::Android, update::build())),
+            Some(status) => Err(update::failure(u16::try_from(status).ok())),
+            None => Err(update::failure(None)),
+        };
+        self.assistant.update_result(result);
     }
 
     fn stop(&mut self) {
@@ -143,6 +174,11 @@ impl Mobile {
                     if event["kind"] == "file" && self.attach_ticket.is_some() && event["ticket"].as_u64() == self.attach_ticket {
                         self.attach_ticket = None;
                         self.picked(event);
+                    } else if event["kind"] == "update" {
+                        if self.update_ticket.is_some() && event["ticket"].as_u64() == self.update_ticket {
+                            self.update_ticket = None;
+                            self.update_reply(event);
+                        }
                     } else if event["kind"] == "http" {
                         if self.run.as_ref().is_some_and(|r| Some(r.ticket) == event["ticket"].as_u64()) {
                             self.reply(event);
@@ -497,6 +533,28 @@ impl Mobile {
                 },
                 // Connecting through a plan's command-line tool is for the desktop only.
                 Action::SetPlan(..) | Action::PlanLogin(_) | Action::PlanInstall(_) | Action::PlanRefresh => {}
+                Action::CheckUpdate => {
+                    self.assistant.settings.update_skipped = 0;
+                    if self.update_ticket.is_none() {
+                        self.check_update();
+                    }
+                }
+                Action::OpenUpdate => {
+                    if let Some(release) = &self.assistant.update {
+                        let (build, url) = (release.build, release.download.clone());
+                        if let Err(e) = self.platform.exchange(json!({"op":"open_url","url":url})) {
+                            self.assistant.update_status = Some(e);
+                        }
+                        self.assistant.settings.update_skipped = build;
+                        self.save_settings();
+                    }
+                }
+                Action::SkipUpdate => {
+                    if let Some(release) = &self.assistant.update {
+                        self.assistant.settings.update_skipped = release.build;
+                        self.save_settings();
+                    }
+                }
                 Action::Attach => self.attach(),
                 Action::PasteImage => self.paste_image(),
                 Action::RemoveAttachment(index) => {
@@ -571,6 +629,9 @@ impl eframe::App for Mobile {
         // egui's own Ctrl +/- zoom would fight the editor's document zoom shortcuts.
         ctx.options_mut(|o| o.zoom_with_keyboard = false);
         self.poll(ctx);
+        if self.update_ticket.is_none() && self.assistant.update_due(unix_now()) {
+            self.check_update();
+        }
         self.editor.logic(ctx);
         self.chrome(ctx);
         if self.last_recovery.elapsed() >= Duration::from_secs(20) {
@@ -616,6 +677,7 @@ impl eframe::App for Mobile {
         }
         self.editor.ui(ui);
         self.assistant.launcher(ui.ctx());
+        self.assistant.update_notice(ui.ctx(), &crate::BRANDING);
         let actions = self.assistant.take_actions();
         self.act(actions);
         match self.editor.host_action() {

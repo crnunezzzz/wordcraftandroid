@@ -345,6 +345,14 @@ public final class CraftActivity extends GameActivity {
                 provider(request);
                 worker.execute(() -> http(request));
                 return new JSONObject();
+            case "update_check": {
+                // Only GitHub's public list of this app's releases: no key, nothing of the user's.
+                String repo = request.getString("repo");
+                if (!repo.matches("[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}") || repo.contains("..")) throw new IOException("Bad repository");
+                long ticket = request.getLong("ticket");
+                worker.execute(() -> updateCheck(ticket, repo));
+                return new JSONObject();
+            }
             case "cancel_http": {
                 long ticket = request.getLong("ticket");
                 cancelled.add(ticket);
@@ -436,6 +444,31 @@ public final class CraftActivity extends GameActivity {
         } finally {
             requests.remove(request.optLong("ticket")); cancelled.remove(request.optLong("ticket"));
             if (connection != null) connection.disconnect(); post(event);
+        }
+    }
+
+    private void updateCheck(long ticket, String repo) {
+        JSONObject event = new JSONObject();
+        HttpsURLConnection connection = null;
+        try {
+            event.put("kind", "update").put("ticket", ticket);
+            connection = (HttpsURLConnection) new URL("https://api.github.com/repos/" + repo + "/releases?per_page=20").openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(15_000); connection.setReadTimeout(30_000);
+            connection.setRequestProperty("Accept", "application/vnd.github+json");
+            connection.setRequestProperty("User-Agent", "craft-ia-updates");
+            int status = connection.getResponseCode();
+            event.put("status", status);
+            if (status == 200) {
+                try (InputStream in = connection.getInputStream()) {
+                    event.put("body", new JSONArray(new String(readLimited(in, 4 * 1024 * 1024), StandardCharsets.UTF_8)));
+                }
+            }
+        } catch (Exception e) {
+            event.remove("status");
+        } finally {
+            if (connection != null) connection.disconnect();
+            post(event);
         }
     }
 

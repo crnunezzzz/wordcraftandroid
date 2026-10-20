@@ -98,6 +98,22 @@ fn scenario(name: &str) -> Assistant {
                 Entry::Error { text: "Has alcanzado el límite de uso de tu plan por ahora. Espera a que se renueve o usa una clave de API.\nClaude AI usage limit reached".into(), retry: true, key: false },
             ];
         }
+        "update-desktop" | "update-phone" => {
+            a.host = if name == "update-desktop" { Host::Desktop } else { Host::Android };
+            a.open = false;
+            a.update = Some(wordcraft_assistant::update::Release {
+                build: 42,
+                version: "0.8.1".into(),
+                page: "https://github.com/crnunezzzz/wordcraftandroid/releases/tag/ia-v0.8.1-42".into(),
+                download: "https://github.com/crnunezzzz/wordcraftandroid/releases/download/ia-v0.8.1-42/WordCraft-IA-0.8.1-windows-x64.zip".into(),
+            });
+        }
+        "update-settings" => {
+            a.host = Host::Desktop;
+            a.view = View::Settings;
+            a.build = 37;
+            a.update_status = Some("Hay una versión nueva: 0.8.1 (compilación 42).".into());
+        }
         _ => {}
     }
     a
@@ -107,11 +123,25 @@ fn main() {
     let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "target/assistant-preview".into()));
     let _ = std::fs::create_dir_all(&out);
     let only: Vec<String> = std::env::args().skip(2).collect();
-    for name in ["closed", "empty", "conversation", "error", "settings", "attachments", "phone", "desktop-plans", "desktop-mixed", "desktop-chat"] {
+    for name in [
+        "closed",
+        "empty",
+        "conversation",
+        "error",
+        "settings",
+        "attachments",
+        "phone",
+        "desktop-plans",
+        "desktop-mixed",
+        "desktop-chat",
+        "update-desktop",
+        "update-phone",
+        "update-settings",
+    ] {
         if !only.is_empty() && !only.iter().any(|o| o == name) {
             continue;
         }
-        let size = if name == "phone" { egui::vec2(700.0, 1100.0) } else { egui::vec2(1440.0, 900.0) };
+        let size = if name == "phone" || name == "update-phone" { egui::vec2(700.0, 1100.0) } else { egui::vec2(1440.0, 900.0) };
         let services = Services { host_toolbar: Some(Default::default()), ..Default::default() };
         let app = WordApp::new(Session::new(wordcraft_engine::sample::sample_document()), services);
         let state = State { app, assistant: scenario(name) };
@@ -129,6 +159,7 @@ fn main() {
                 }
                 s.app.ui(ui);
                 s.assistant.launcher(&ctx);
+                s.assistant.update_notice(&ctx, &wordcraft_assistant::BRANDING);
             },
             state,
         );
