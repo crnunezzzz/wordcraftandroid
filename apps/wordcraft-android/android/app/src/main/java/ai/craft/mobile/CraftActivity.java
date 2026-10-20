@@ -1,6 +1,12 @@
 package ai.craft.mobile;
 
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageInstaller;
+import android.provider.Settings;
 import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.ColorFilter;
@@ -86,6 +92,15 @@ public final class CraftActivity extends GameActivity {
     private static final int CLIPBOARD_LIMIT = 2 * 1024 * 1024;
     private static final int RESPONSE_LIMIT = 8 * 1024 * 1024;
     private static final int INPUT_LIMIT = 4096;
+    // Larger than any build so far (about 60 MB); anything bigger is not ours.
+    private static final long APK_LIMIT = 400L * 1024 * 1024;
+    private static final String INSTALL_STATUS = "ai.craft.mobile.INSTALL_STATUS";
+    // The update being installed: one at a time.
+    private final java.util.concurrent.atomic.AtomicBoolean updating = new java.util.concurrent.atomic.AtomicBoolean();
+    // Downloaded, waiting for the user to allow this app to install updates.
+    private volatile File pendingApk;
+    private volatile int installSession = -1;
+    private BroadcastReceiver installReceiver;
     // Each provider authenticates only against its own API host.
     private static final Map<String, String> PROVIDERS = new HashMap<>();
     static {
@@ -207,8 +222,19 @@ public final class CraftActivity extends GameActivity {
         });
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        // Back from «Permitir de esta fuente»: carry on with the downloaded update.
+        File apk = pendingApk;
+        if (apk == null) return;
+        pendingApk = null;
+        if (getPackageManager().canRequestPackageInstalls()) worker.execute(() -> commitUpdate(apk));
+        else updateFailed("Sin el permiso «Permitir de esta fuente» Android no deja instalar la actualización.");
+    }
+
     @Override protected void onDestroy() {
         // Keep the Activity alive until Rust's android_main returns (super waits for its loop).
+        if (installReceiver != null) { try { unregisterReceiver(installReceiver); } catch (Exception ignored) { } installReceiver = null; }
         super.onDestroy();
         worker.shutdownNow();
         sync.shutdown();
@@ -353,6 +379,17 @@ public final class CraftActivity extends GameActivity {
                 worker.execute(() -> updateCheck(ticket, repo));
                 return new JSONObject();
             }
+            case "update_install": {
+                // Only this app's own release files on GitHub, as the update check found them.
+                String repo = request.getString("repo");
+                if (!repo.matches("[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}") || repo.contains("..")) throw new IOException("Bad repository");
+                String url = request.getString("url");
+                if (!url.startsWith("https://github.com/" + repo + "/releases/download/") || !url.endsWith(".apk") || url.length() > 500
+                    || !url.matches("[\\x21-\\x7e]+") || url.contains("..")) throw new IOException("Bad address");
+                if (!updating.compareAndSet(false, true)) throw new IOException("Ya se está instalando una actualización");
+                worker.execute(() -> updateInstall(url));
+                return new JSONObject();
+            }
             case "cancel_http": {
                 long ticket = request.getLong("ticket");
                 cancelled.add(ticket);
@@ -470,6 +507,137 @@ public final class CraftActivity extends GameActivity {
             if (connection != null) connection.disconnect();
             post(event);
         }
+    }
+
+    /** Download the APK (kept in the cache, so a retry does not fetch it again) and install it. */
+    private void updateInstall(String address) {
+        HttpsURLConnection connection = null;
+        try {
+            File dir = new File(getCacheDir(), "update");
+            if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("No cache");
+            File apk = new File(dir, Integer.toHexString(address.hashCode()) + ".apk");
+            if (!apk.isFile()) {
+                File[] old = dir.listFiles();
+                if (old != null) for (File f : old) f.delete();
+                URL url = new URL(address);
+                // GitHub redirects to its file storage (HTTPS too); follow at most a few hops.
+                for (int hop = 0; ; hop++) {
+                    connection = (HttpsURLConnection) url.openConnection();
+                    connection.setInstanceFollowRedirects(false);
+                    connection.setConnectTimeout(20_000); connection.setReadTimeout(60_000);
+                    connection.setRequestProperty("User-Agent", "craft-ia-updates");
+                    int status = connection.getResponseCode();
+                    if (status >= 300 && status < 400 && hop < 5) {
+                        URL next = new URL(url, connection.getHeaderField("Location"));
+                        if (!next.getProtocol().equals("https")) throw new IOException("HTTPS required");
+                        connection.disconnect(); url = next; continue;
+                    }
+                    if (status != 200) { updateFailed("GitHub respondió con un error (" + status + ") al descargar la actualización."); return; }
+                    break;
+                }
+                long total = connection.getContentLengthLong();
+                if (total > APK_LIMIT) throw new IOException("Too large");
+                File part = new File(dir, apk.getName() + ".part");
+                long done = 0, reported = 0, at = 0;
+                try (InputStream in = connection.getInputStream(); OutputStream out = new FileOutputStream(part)) {
+                    byte[] buffer = new byte[256 * 1024]; int size;
+                    while ((size = in.read(buffer)) != -1) {
+                        done += size;
+                        if (done > APK_LIMIT) throw new IOException("Too large");
+                        out.write(buffer, 0, size);
+                        long now = System.currentTimeMillis();
+                        if (done - reported >= 256 * 1024 && now - at >= 200) {
+                            reported = done; at = now;
+                            JSONObject event = new JSONObject().put("kind", "update_install").put("done", done);
+                            if (total > 0) event.put("total", total);
+                            post(event);
+                        }
+                    }
+                }
+                if (total > 0 && done != total) throw new IOException("Incomplete");
+                if (!part.renameTo(apk)) throw new IOException("Rename");
+            }
+            if (!getPackageManager().canRequestPackageInstalls()) {
+                // Android asks once whether this app may install updates; onResume carries on.
+                pendingApk = apk;
+                post(new JSONObject().put("kind", "update_install").put("state", "permission"));
+                runOnUiThread(() -> {
+                    try { startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()))); }
+                    catch (Exception e) { pendingApk = null; updateFailed("No se pudo abrir el ajuste de Android para permitir la instalación."); }
+                });
+                return;
+            }
+            commitUpdate(apk);
+        } catch (java.net.UnknownHostException | java.net.ConnectException | javax.net.ssl.SSLException | java.net.SocketTimeoutException e) {
+            updateFailed("No se pudo descargar la actualización: revisa la conexión.");
+        } catch (Exception e) {
+            updateFailed("No se pudo descargar la actualización (" + e.getClass().getSimpleName() + ").");
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    /** Hand the APK to Android's installer; it asks the user to confirm (see installReceiver). */
+    private void commitUpdate(File apk) {
+        try {
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            // Android refuses the session unless the APK is this same app (and signed like it).
+            params.setAppPackageName(getPackageName());
+            params.setSize(apk.length());
+            int id = installer.createSession(params);
+            try (PackageInstaller.Session session = installer.openSession(id)) {
+                try (InputStream in = new FileInputStream(apk); OutputStream out = session.openWrite("update.apk", 0, apk.length())) {
+                    byte[] buffer = new byte[256 * 1024]; int size;
+                    while ((size = in.read(buffer)) != -1) out.write(buffer, 0, size);
+                    session.fsync(out);
+                }
+                listenForInstall();
+                installSession = id;
+                Intent status = new Intent(INSTALL_STATUS).setPackage(getPackageName());
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                // Reported first: Android's answer (a failure, say) must come after it.
+                post(new JSONObject().put("kind", "update_install").put("state", "confirm"));
+                session.commit(PendingIntent.getBroadcast(this, id, status, flags).getIntentSender());
+            }
+        } catch (Exception e) {
+            updateFailed("Android no aceptó la actualización (" + e.getClass().getSimpleName() + ").");
+        }
+    }
+
+    private synchronized void listenForInstall() {
+        if (installReceiver != null) return;
+        installReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                // Only the session this app committed.
+                if (intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -2) != installSession) return;
+                int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+                if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                    Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                    if (confirm == null) { updateFailed("Android no mostró la ventana de instalación."); return; }
+                    try { startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); }
+                    catch (Exception e) { updateFailed("Android no mostró la ventana de instalación."); }
+                } else if (status == PackageInstaller.STATUS_SUCCESS) {
+                    updating.set(false);
+                } else if (status == PackageInstaller.STATUS_FAILURE_ABORTED) {
+                    updateFailed("Se canceló la instalación. Pulsa «Reintentar» cuando quieras.");
+                } else if (status == PackageInstaller.STATUS_FAILURE_CONFLICT || status == PackageInstaller.STATUS_FAILURE_INCOMPATIBLE) {
+                    updateFailed("Android rechazó la actualización: la APK no está firmada con la misma clave que esta app.");
+                } else if (status == PackageInstaller.STATUS_FAILURE_STORAGE) {
+                    updateFailed("No hay espacio suficiente para instalar la actualización.");
+                } else {
+                    String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                    updateFailed("Android no pudo instalar la actualización" + (message == null ? "." : " (" + message.substring(0, Math.min(200, message.length())) + ")."));
+                }
+            }
+        };
+        // Private to this app on every version (before Android 13 through androidx's permission).
+        androidx.core.content.ContextCompat.registerReceiver(this, installReceiver, new IntentFilter(INSTALL_STATUS), androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+    }
+
+    private void updateFailed(String message) {
+        updating.set(false);
+        try { post(new JSONObject().put("kind", "update_install").put("error", message)); } catch (Exception ignored) { }
     }
 
     private void showPicker(JSONObject request) {

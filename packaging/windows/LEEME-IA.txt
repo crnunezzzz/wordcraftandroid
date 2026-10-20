@@ -15,8 +15,8 @@ POR QUÉ ES UNA INSTALACIÓN APARTE
   asistente. WordCraft IA vive en otra carpeta (%LOCALAPPDATA%\Programs\WordCraft IA), así que
   esas actualizaciones nunca lo borran. Las mejoras del proyecto original llegan a WordCraft IA
   con las versiones nuevas que se publican en GitHub (Releases del fork). La app avisa sola
-  («Hay una versión nueva» › Descargar): descomprime el zip nuevo y vuelve a ejecutar
-  install-ia.ps1. Ajustes, documentos recientes y claves se conservan.
+  («Hay una versión nueva» › Actualizar): descarga la versión, se cierra, la instala y se
+  vuelve a abrir. Ajustes, documentos recientes y claves se conservan.
 
 CONECTAR LA IA (pestaña Asistente › engranaje)
   - Clave de API de OpenAI o de Anthropic: pagas por uso; la clave se guarda en el

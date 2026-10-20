@@ -3,7 +3,7 @@
 //! an error, the settings, attached files, and a narrow phone-sized window.
 //!
 //! `cargo run -p wordcraft-assistant --example assistant_preview -- /abs/out/dir`
-use wordcraft_assistant::assistant::{Assistant, Busy, Chip, Entry, Host, PlanInfo, Step, View};
+use wordcraft_assistant::assistant::{Assistant, Busy, Chip, Entry, Host, Installing, PlanInfo, Step, View};
 use wordcraft_assistant::attach;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
@@ -98,8 +98,19 @@ fn scenario(name: &str) -> Assistant {
                 Entry::Error { text: "Has alcanzado el límite de uso de tu plan por ahora. Espera a que se renueve o usa una clave de API.\nClaude AI usage limit reached".into(), retry: true, key: false },
             ];
         }
-        "update-desktop" | "update-phone" => {
-            a.host = if name == "update-desktop" { Host::Desktop } else { Host::Android };
+        "update-desktop" | "update-phone" | "update-downloading" | "update-restarting" | "update-error" | "update-confirm" | "update-permission" => {
+            let phone = matches!(name, "update-phone" | "update-confirm" | "update-permission");
+            a.host = if phone { Host::Android } else { Host::Desktop };
+            a.installing = match name {
+                "update-downloading" => Some(Installing::Downloading { done: 21 * 1024 * 1024, total: Some(48 * 1024 * 1024) }),
+                "update-restarting" => Some(Installing::Restarting),
+                "update-confirm" => Some(Installing::Confirming),
+                "update-permission" => Some(Installing::Permission),
+                _ => None,
+            };
+            if name == "update-error" {
+                a.install_error = Some("La descarga se cortó: revisa la conexión y vuelve a intentarlo.".into());
+            }
             a.open = false;
             a.update = Some(wordcraft_assistant::update::Release {
                 build: 42,
@@ -137,11 +148,20 @@ fn main() {
         "update-desktop",
         "update-phone",
         "update-settings",
+        "update-downloading",
+        "update-restarting",
+        "update-error",
+        "update-confirm",
+        "update-permission",
     ] {
         if !only.is_empty() && !only.iter().any(|o| o == name) {
             continue;
         }
-        let size = if name == "phone" || name == "update-phone" { egui::vec2(700.0, 1100.0) } else { egui::vec2(1440.0, 900.0) };
+        let size = if matches!(name, "phone" | "update-phone" | "update-confirm" | "update-permission") {
+            egui::vec2(700.0, 1100.0)
+        } else {
+            egui::vec2(1440.0, 900.0)
+        };
         let services = Services { host_toolbar: Some(Default::default()), ..Default::default() };
         let app = WordApp::new(Session::new(wordcraft_engine::sample::sample_document()), services);
         let state = State { app, assistant: scenario(name) };

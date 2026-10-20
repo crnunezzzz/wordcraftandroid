@@ -11,12 +11,13 @@
 
 pub mod bridge;
 pub mod http;
+pub mod install;
 pub mod plan;
 pub mod secrets;
 
 use crate::{
     agent::{self, Editor},
-    assistant::{Action, Assistant, Branding, Busy, COMPOSER_ID, Chip, Entry, Host, PlanInfo, Settings, Step, View, plan_index},
+    assistant::{Action, Assistant, Branding, Busy, COMPOSER_ID, Chip, Entry, Host, Installing, PlanInfo, Settings, Step, View, plan_index},
     attach::{self, Attachment},
     protocol::{self, Degrade, Provider, Thread},
     update::{self, Release},
@@ -90,6 +91,7 @@ pub struct Desktop {
     prepared: (Sender<Prepared>, Receiver<Prepared>),
     checks: (Sender<(Provider, PlanInfo)>, Receiver<(Provider, PlanInfo)>),
     updates: (Sender<Result<Option<Release>, String>>, Receiver<Result<Option<Release>, String>>),
+    installs: (Sender<install::Msg>, Receiver<install::Msg>),
     /// The system's display scale (native pixels per point).
     native: f32,
     was_settings: bool,
@@ -123,6 +125,7 @@ impl Desktop {
             prepared: mpsc::channel(),
             checks: mpsc::channel(),
             updates: mpsc::channel(),
+            installs: mpsc::channel(),
             native: 1.0,
             was_settings: false,
             plan_programs: [None, None],
@@ -132,7 +135,71 @@ impl Desktop {
                 desktop.check(provider, Duration::ZERO);
             }
         }
+        // The last update's helper could not replace the program: say so, and look again now.
+        let report = desktop.dir.join(install::REPORT);
+        if let Ok(text) = std::fs::read_to_string(&report) {
+            let _ = std::fs::remove_file(&report);
+            let text: String = text.trim_start_matches('\u{feff}').trim().chars().take(400).collect();
+            if !text.is_empty() {
+                desktop.assistant.install_error = Some(text);
+                desktop.assistant.settings.update_checked = 0;
+                desktop.assistant.settings.update_skipped = 0;
+            }
+        }
         desktop
+    }
+
+    /// «Actualizar»: download and unpack the new build off the UI thread (Windows); elsewhere,
+    /// open its file in the browser.
+    fn install_update(&mut self) {
+        let Some(release) = &self.assistant.update else { return };
+        if self.assistant.installing.is_some() {
+            return;
+        }
+        if !cfg!(windows) {
+            if let Err(e) = open::that_detached(&release.download) {
+                self.assistant.update_status = Some(format!("No se pudo abrir el navegador ({e}). Descárgala desde {}", release.page));
+            }
+            return;
+        }
+        let exe = match install::this_copy() {
+            Ok((exe, _)) => exe,
+            Err(e) => return self.assistant.install_failed(e),
+        };
+        let url = release.download.clone();
+        let work = std::env::temp_dir().join(format!("{}-IA-update", self.app));
+        let tx = self.installs.0.clone();
+        let spawned = std::thread::Builder::new().name("craft-update-download".into()).spawn(move || install::download(&url, &work, &exe, &tx));
+        match spawned {
+            Ok(_) => {
+                self.assistant.install_error = None;
+                self.assistant.installing = Some(Installing::Downloading { done: 0, total: None });
+            }
+            Err(e) => self.assistant.install_failed(format!("No se pudo empezar la descarga ({e}).")),
+        }
+    }
+
+    /// The download's progress; once unpacked, start the helper and close the window.
+    fn install_events(&mut self, ctx: &Context) {
+        while let Ok(msg) = self.installs.1.try_recv() {
+            match msg {
+                install::Msg::Progress(done, total) => self.assistant.installing = Some(Installing::Downloading { done, total }),
+                install::Msg::Failed(e) => self.assistant.install_failed(e),
+                install::Msg::Ready(staged) => {
+                    let launched =
+                        install::this_copy().and_then(|(exe, dest)| install::launch(&staged, &exe, &dest, &self.dir.join(install::REPORT)));
+                    match launched {
+                        Ok(()) => {
+                            self.assistant.installing = Some(Installing::Restarting);
+                            self.save_settings();
+                            // Through the app's own close path: unsaved changes are asked about.
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        Err(e) => self.assistant.install_failed(e),
+                    }
+                }
+            }
+        }
     }
 
     pub fn toggle(&mut self) {
@@ -249,6 +316,7 @@ impl Desktop {
         while let Ok(result) = self.updates.1.try_recv() {
             self.assistant.update_result(result);
         }
+        self.install_events(ctx);
         if self.assistant.update_due(unix_now()) {
             self.check_update();
         }
@@ -388,17 +456,9 @@ impl Desktop {
                         self.check_update();
                     }
                 }
-                Action::OpenUpdate => {
-                    if let Some(release) = &self.assistant.update {
-                        let build = release.build;
-                        if let Err(e) = open::that_detached(&release.download) {
-                            self.assistant.update_status = Some(format!("No se pudo abrir el navegador ({e}). Descárgala desde {}", release.page));
-                        }
-                        self.assistant.settings.update_skipped = build;
-                        self.save_settings();
-                    }
-                }
+                Action::InstallUpdate => self.install_update(),
                 Action::SkipUpdate => {
+                    self.assistant.install_error = None;
                     if let Some(release) = &self.assistant.update {
                         self.assistant.settings.update_skipped = release.build;
                         self.save_settings();

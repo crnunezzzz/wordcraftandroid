@@ -71,14 +71,21 @@ los sobrescribiría. Por eso WordCraft IA:
 Las dos apps (Windows y Android) consultan dos veces al día la lista pública de versiones del
 repositorio en GitHub. No se envía nada del usuario: es la misma lista que se ve en *Releases*.
 Si hay una compilación más nueva que la instalada, aparece el aviso «Hay una versión nueva» con
-**Descargar** (abre el archivo en el navegador) y **Ahora no** (no vuelve a avisar de esa
-compilación). En el asistente › engranaje › **Actualizaciones** se puede desactivar el aviso o
-buscar al momento.
+**Actualizar** y **Ahora no** (no vuelve a avisar de esa compilación). En el asistente ›
+engranaje › **Actualizaciones** se puede desactivar el aviso o buscar al momento.
 
-- **Windows:** descarga el zip, descomprímelo y vuelve a ejecutar `install-ia.ps1`.
-- **Android:** abre la APK descargada para instalarla encima. Android pide una vez permiso para
-  instalar apps desde el navegador. Se conservan documentos, ajustes y claves porque todas las
-  APK llevan la misma firma.
+- **Windows:** «Actualizar» descarga el zip de la versión y saca de él solo `wordcraft.exe`,
+  `wordcraft-cli.exe` y `LEEME-IA.txt`. Un pequeño script de PowerShell, oculto, espera a que la
+  app se cierre, copia esos archivos encima de esta copia y la vuelve a abrir. La app se cierra
+  por su camino normal, así que pregunta antes si hay cambios sin guardar. Si se cancela el
+  cierre, la versión nueva se instala al cerrar la app. Si no se pudo reemplazar el programa
+  (por ejemplo, porque estaba en una carpeta sin permiso de escritura), la próxima vez que se
+  abre la app lo dice en el aviso, junto con «Reintentar».
+- **Android:** «Actualizar» descarga la APK dentro de la app y se la pasa al instalador de
+  Android (`PackageInstaller`), que muestra su ventana: se pulsa «Actualizar» y listo. La primera
+  vez Android pide activar «Permitir de esta fuente» para la app; al volver, la instalación sigue
+  sola. Android solo acepta la APK si es la misma app firmada con la misma clave, y se conservan
+  documentos, ajustes y claves. Tras instalar, se vuelve a abrir la app desde su icono.
 
 Cada compilación del workflow lleva su número (`CRAFT_IA_BUILD`) y su repositorio
 (`CRAFT_IA_REPO`); una compilación hecha a mano tiene el número 0, así que avisa de la primera

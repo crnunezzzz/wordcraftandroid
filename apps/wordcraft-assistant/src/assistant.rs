@@ -4,7 +4,7 @@
 #![forbid(unsafe_code)]
 
 use crate::{
-    attach::Attachment,
+    attach::{self, Attachment},
     protocol::{self, MODELS, Provider},
     update::{self, Release},
 };
@@ -156,10 +156,24 @@ pub enum Action {
     PlanRefresh,
     /// Look for a new build now (from the settings).
     CheckUpdate,
-    /// Open the new build's file in the browser.
-    OpenUpdate,
+    /// Download the new build and install it (desktop: over this copy, then reopen it;
+    /// Android: through the system's installer).
+    InstallUpdate,
     /// «Ahora no»: no notice for this build.
     SkipUpdate,
+}
+
+/// Where installing a new build stands, as the host reports it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Installing {
+    /// Bytes so far, of the total when the server said it.
+    Downloading { done: u64, total: Option<u64> },
+    /// Desktop: the files are ready; the app is closing so the helper can replace it.
+    Restarting,
+    /// Android: the system's installer is asking the user to confirm.
+    Confirming,
+    /// Android: waiting for the user to let this app install updates (a system setting).
+    Permission,
 }
 
 /// Work in progress, as the host reports it each frame.
@@ -199,6 +213,10 @@ pub struct Assistant {
     pub update_checking: bool,
     /// The last check's outcome, for the settings.
     pub update_status: Option<String>,
+    /// An install in progress.
+    pub installing: Option<Installing>,
+    /// Why the last install failed, shown in the notice.
+    pub install_error: Option<String>,
     actions: Vec<Action>,
     composer_height: f32,
 }
@@ -541,13 +559,14 @@ impl Assistant {
     /// The notice for a new build, over the editor (drawn whether or not the panel is open).
     pub fn update_notice(&mut self, ctx: &Context, brand: &Branding) {
         let Some(release) = &self.update else { return };
-        if release.build == self.settings.update_skipped {
+        if release.build == self.settings.update_skipped && self.installing.is_none() && self.install_error.is_none() {
             return;
         }
         let desktop = self.host == Host::Desktop;
         let screen = ctx.content_rect();
         let width = (screen.width() - 32.0).clamp(200.0, 380.0);
         let lift = if desktop { 48.0 } else { 128.0 };
+        let name = if desktop { format!("{} IA", brand.name) } else { brand.name.to_owned() };
         let mut chosen = None;
         egui::Area::new(egui::Id::new("assistant_update")).order(egui::Order::Foreground).anchor(Align2::LEFT_BOTTOM, vec2(16.0, -lift)).show(
             ctx,
@@ -562,33 +581,98 @@ impl Assistant {
                     .shadow(egui::Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(50) })
                     .show(ui, |ui| {
                         ui.set_width(width - 28.0);
-                        let name = if desktop { format!("{} IA", brand.name) } else { brand.name.to_owned() };
-                        ui.label(RichText::new(format!("Hay una versión nueva de {name}")).strong().size(15.5).color(palette.strong));
-                        ui.add_space(4.0);
-                        let how = if desktop {
-                            "Descarga el zip y ejecuta install-ia.ps1: tus ajustes y claves se conservan."
-                        } else {
-                            "Descarga la APK y ábrela para instalarla encima: tus documentos, ajustes y claves se conservan."
+                        let paragraph = |ui: &mut Ui, text: String, color: Color32| {
+                            ui.add(egui::Label::new(RichText::new(text).color(color)).wrap());
                         };
-                        let text = format!("Versión {}, compilación {}. {how}", release.version, release.build);
-                        ui.add(egui::Label::new(RichText::new(text).color(palette.text)).wrap());
-                        ui.add_space(10.0);
-                        ui.horizontal(|ui| {
-                            let download = egui::Button::new(RichText::new("Descargar").color(palette.on_accent).strong())
-                                .fill(palette.accent)
-                                .corner_radius(10)
-                                .min_size(vec2(112.0, 36.0));
-                            if ui.add(download).clicked() {
-                                chosen = Some(Action::OpenUpdate);
+                        match self.installing {
+                            Some(Installing::Downloading { done, total }) => {
+                                ui.label(RichText::new(format!("Descargando la versión {}…", release.version)).strong().size(15.5).color(palette.strong));
+                                ui.add_space(8.0);
+                                let fraction = total.filter(|t| *t > 0).map(|t| (done as f32 / t as f32).clamp(0.0, 1.0));
+                                let bar = egui::ProgressBar::new(fraction.unwrap_or(0.0)).desired_height(8.0).fill(palette.accent);
+                                ui.add(if fraction.is_some() { bar } else { bar.animate(true) });
+                                ui.add_space(6.0);
+                                let amount = match total {
+                                    Some(total) if total > 0 => format!("{} de {}", attach::size(done as usize), attach::size(total as usize)),
+                                    _ => attach::size(done as usize),
+                                };
+                                paragraph(ui, format!("{amount}. Puedes seguir trabajando mientras tanto."), palette.weak);
+                                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                             }
-                            if ui.add(egui::Button::new("Ahora no").corner_radius(10).min_size(vec2(96.0, 36.0))).clicked() {
-                                chosen = Some(Action::SkipUpdate);
+                            Some(Installing::Restarting) => {
+                                ui.label(RichText::new("Instalando la versión nueva…").strong().size(15.5).color(palette.strong));
+                                ui.add_space(4.0);
+                                paragraph(
+                                    ui,
+                                    format!(
+                                        "{name} se cierra y se vuelve a abrir solo. Si te pide guardar, guarda. Si cancelas el cierre, la versión nueva se instalará cuando cierres {name}."
+                                    ),
+                                    palette.text,
+                                );
                             }
-                        });
+                            Some(Installing::Confirming) => {
+                                ui.label(RichText::new("Confirma la instalación").strong().size(15.5).color(palette.strong));
+                                ui.add_space(4.0);
+                                paragraph(
+                                    ui,
+                                    "Android muestra su ventana de instalación: pulsa «Actualizar». La app se cerrará y la abres de nuevo ya actualizada.".into(),
+                                    palette.text,
+                                );
+                            }
+                            Some(Installing::Permission) => {
+                                ui.label(RichText::new("Falta un permiso de Android").strong().size(15.5).color(palette.strong));
+                                ui.add_space(4.0);
+                                paragraph(
+                                    ui,
+                                    format!(
+                                        "Activa «Permitir de esta fuente» para {name} y vuelve con «Atrás»: la instalación seguirá sola. Solo se pide la primera vez."
+                                    ),
+                                    palette.text,
+                                );
+                            }
+                            None => {
+                                ui.label(RichText::new(format!("Hay una versión nueva de {name}")).strong().size(15.5).color(palette.strong));
+                                ui.add_space(4.0);
+                                let how = if desktop {
+                                    format!("Al pulsar «Actualizar» se descarga, se instala y {name} se vuelve a abrir.")
+                                } else {
+                                    "Al pulsar «Actualizar» se descarga y Android te pide confirmar la instalación.".to_owned()
+                                };
+                                let text = format!(
+                                    "Versión {}, compilación {}. {how} Tus documentos, ajustes y claves se conservan.",
+                                    release.version, release.build
+                                );
+                                paragraph(ui, text, palette.text);
+                                if let Some(error) = &self.install_error {
+                                    ui.add_space(6.0);
+                                    paragraph(ui, error.clone(), palette.error);
+                                }
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    let label = if self.install_error.is_some() { "Reintentar" } else { "Actualizar" };
+                                    let install = egui::Button::new(RichText::new(label).color(palette.on_accent).strong())
+                                        .fill(palette.accent)
+                                        .corner_radius(10)
+                                        .min_size(vec2(112.0, 36.0));
+                                    if ui.add(install).clicked() {
+                                        chosen = Some(Action::InstallUpdate);
+                                    }
+                                    if ui.add(egui::Button::new("Ahora no").corner_radius(10).min_size(vec2(96.0, 36.0))).clicked() {
+                                        chosen = Some(Action::SkipUpdate);
+                                    }
+                                });
+                            }
+                        }
                     });
             },
         );
         self.actions.extend(chosen);
+    }
+
+    /// The host's install failed (or the user cancelled it): the notice offers it again.
+    pub fn install_failed(&mut self, error: String) {
+        self.installing = None;
+        self.install_error = Some(error);
     }
 
     pub fn has_key(&self, provider: Provider) -> bool {
@@ -928,9 +1012,13 @@ impl Assistant {
         } else {
             format!("Esta copia es la compilación {}.", self.build)
         };
-        let what = if self.host == Host::Desktop { "el zip para Windows" } else { "la APK" };
+        let what = if self.host == Host::Desktop {
+            "«Actualizar» la descarga, la instala y vuelve a abrir la app"
+        } else {
+            "«Actualizar» la descarga y Android pide confirmar la instalación"
+        };
         let text = format!(
-            "{this} Dos veces al día se consulta la lista de versiones publicadas en GitHub; no se envía nada tuyo. Si hay una nueva, aparece un aviso para descargar {what}."
+            "{this} Dos veces al día se consulta la lista de versiones publicadas en GitHub; no se envía nada tuyo. Si hay una nueva, aparece un aviso: {what}."
         );
         ui.add(egui::Label::new(RichText::new(text).color(palette.weak)).wrap());
         if let Some(status) = &self.update_status {
@@ -943,8 +1031,11 @@ impl Assistant {
             if ui.add_enabled(!self.update_checking, egui::Button::new(label).corner_radius(10).min_size(vec2(120.0, 32.0))).clicked() {
                 self.actions.push(Action::CheckUpdate);
             }
-            if self.update.is_some() && ui.add(egui::Button::new("Descargar").corner_radius(10).min_size(vec2(110.0, 32.0))).clicked() {
-                self.actions.push(Action::OpenUpdate);
+            if self.update.is_some()
+                && self.installing.is_none()
+                && ui.add(egui::Button::new("Actualizar").corner_radius(10).min_size(vec2(110.0, 32.0))).clicked()
+            {
+                self.actions.push(Action::InstallUpdate);
             }
         });
     }

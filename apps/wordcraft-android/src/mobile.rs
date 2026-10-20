@@ -2,7 +2,7 @@
 
 use crate::{
     adapter::Editor,
-    assistant::{Action, Assistant, Busy, COMPOSER_ID, Chip, Entry, Settings, Step, View},
+    assistant::{Action, Assistant, Busy, COMPOSER_ID, Chip, Entry, Installing, Settings, Step, View},
     attach::{self, Attachment},
     platform::Platform,
     protocol::{self, Degrade, Thread},
@@ -154,6 +154,20 @@ impl Mobile {
         self.assistant.update_result(result);
     }
 
+    /// Java's progress with the new build: download, permission, Android's confirmation.
+    fn install_event(&mut self, event: &Value) {
+        if let Some(error) = event["error"].as_str() {
+            let error: String = error.chars().take(400).collect();
+            self.assistant.install_failed(error);
+        } else if event["state"] == "confirm" {
+            self.assistant.installing = Some(Installing::Confirming);
+        } else if event["state"] == "permission" {
+            self.assistant.installing = Some(Installing::Permission);
+        } else if let Some(done) = event["done"].as_u64() {
+            self.assistant.installing = Some(Installing::Downloading { done, total: event["total"].as_u64() });
+        }
+    }
+
     fn stop(&mut self) {
         if let Some(run) = self.run.take() {
             let _ = self.platform.exchange(json!({"op":"cancel_http","ticket":run.ticket}));
@@ -179,6 +193,8 @@ impl Mobile {
                             self.update_ticket = None;
                             self.update_reply(event);
                         }
+                    } else if event["kind"] == "update_install" {
+                        self.install_event(event);
                     } else if event["kind"] == "http" {
                         if self.run.as_ref().is_some_and(|r| Some(r.ticket) == event["ticket"].as_u64()) {
                             self.reply(event);
@@ -539,17 +555,22 @@ impl Mobile {
                         self.check_update();
                     }
                 }
-                Action::OpenUpdate => {
-                    if let Some(release) = &self.assistant.update {
-                        let (build, url) = (release.build, release.download.clone());
-                        if let Err(e) = self.platform.exchange(json!({"op":"open_url","url":url})) {
-                            self.assistant.update_status = Some(e);
+                Action::InstallUpdate => {
+                    if let Some(release) = &self.assistant.update
+                        && self.assistant.installing.is_none()
+                    {
+                        let request = json!({"op":"update_install","repo":update::repo(crate::RELEASES),"url":release.download});
+                        match self.platform.exchange(request) {
+                            Ok(_) => {
+                                self.assistant.install_error = None;
+                                self.assistant.installing = Some(Installing::Downloading { done: 0, total: None });
+                            }
+                            Err(e) => self.assistant.install_failed(e),
                         }
-                        self.assistant.settings.update_skipped = build;
-                        self.save_settings();
                     }
                 }
                 Action::SkipUpdate => {
+                    self.assistant.install_error = None;
                     if let Some(release) = &self.assistant.update {
                         self.assistant.settings.update_skipped = release.build;
                         self.save_settings();

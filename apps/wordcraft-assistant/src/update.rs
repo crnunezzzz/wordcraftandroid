@@ -6,8 +6,9 @@
 //! (`CRAFT_IA_REPO`); a local build has number 0, so any published build is newer.
 //!
 //! The hosts fetch [`api_url`] themselves (desktop: HTTPS here; Android: Java) and hand the
-//! reply to [`latest`]. Nothing is downloaded or installed by the app: «Descargar» opens the
-//! file's address in the browser.
+//! reply to [`latest`]. «Actualizar» then installs the file: on Windows the desktop host
+//! replaces this copy and reopens it (`desktop::install`); on Android Java hands the APK to the
+//! system's installer, which asks the user to confirm.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
