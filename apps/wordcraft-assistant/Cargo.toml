@@ -1,0 +1,39 @@
+[package]
+name = "wordcraft-assistant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The AI assistant panel shared by WordCraft's desktop and Android hosts"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+egui = { workspace = true }
+zeroize = { version = "1", features = ["derive"] }
+image = { workspace = true }
+quick-xml = { workspace = true }
+zip = { workspace = true }
+
+# Desktop only: HTTPS to the providers, the plan CLIs and the tool bridge they call back.
+[target.'cfg(not(any(target_os = "android", target_arch = "wasm32")))'.dependencies]
+ureq = { version = "3", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
+getrandom = { workspace = true }
+# The attachment picker and pasted pictures (already in the desktop app's build).
+rfd = { workspace = true }
+pollster = "0.4"
+# «Descargar» on a new build opens its file in the browser.
+open = "5"
+arboard = { workspace = true, features = ["image-data"] }
+
+# API keys live in the system's own credential store (Credential Manager, Keychain).
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+keyring = { version = "3", features = ["windows-native", "apple-native"] }
+
+[dev-dependencies]
+egui_kittest = { workspace = true, features = ["wgpu", "snapshot"] }
+wordcraft-engine = { workspace = true }
+wordcraft-ui-egui = { workspace = true }

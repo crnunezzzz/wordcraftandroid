@@ -22,6 +22,8 @@ pub struct Editor {
 }
 impl Editor {
     pub const NAME: &'static str = "WordCraft";
+    /// The canvas coasts after a flick by itself (wheel phases), so the host must not.
+    pub const OWN_MOMENTUM: bool = true;
     pub fn new(dir: &Path, platform: Platform, ctx: &Context) -> Self {
         let _ = wordcraft_fonts::FontDb::global().load_user_fonts(&dir.join("fonts"));
         let pending: Pending = Rc::new(RefCell::new(HashMap::new()));
@@ -106,6 +108,19 @@ impl Editor {
             host.status = status.into();
         }
     }
+    /// The interface size as a zoom over the system's display scale `native` (1.0: as
+    /// Android draws it). WordCraft stores it as the drawn size; Auto is the system's.
+    pub fn interface_scale(&self, native: f32) -> f32 {
+        self.app.ui.interface_size.zoom_factor(native)
+    }
+    pub fn set_interface_scale(&mut self, native: f32, scale: f32) {
+        use wordcraft_ui_egui::theme::InterfaceSize;
+        self.app.ui.interface_size = if (scale - 1.0).abs() < 0.01 {
+            InterfaceSize::AUTO
+        } else {
+            InterfaceSize::from_percent(f64::from(scale * native * 100.0)).unwrap_or(InterfaceSize::AUTO)
+        };
+    }
     pub fn host_action(&mut self) -> Option<&'static str> {
         self.app.services.host_toolbar.as_mut()?.action.take()
     }
@@ -137,9 +152,6 @@ impl Editor {
             return json!({"error":e});
         }
         self.app.session.run("document.inspect", &json!({})).unwrap_or_else(|e| json!({"error":e.to_string()}))
-    }
-    pub fn stamp(&self) -> String {
-        format!("{}:{}:{:?}", self.app.session.document_id(), self.app.session.rev(), self.app.session.sel)
     }
     pub fn file_event(&mut self, event: &Value) {
         if event["external"] == true

@@ -12,6 +12,7 @@
 mod animations;
 #[cfg(target_os = "macos")]
 mod apple_events;
+mod assistant_host;
 mod clipboard;
 mod control_server;
 mod default_apps;
@@ -32,19 +33,22 @@ use wordcraft_ui_egui::{
 
 /// The app, the restored window geometry (or, with none, the default: no position) until the
 /// first frame that knows the monitor has checked it, the control server's key file (removed on
-/// exit), the file dialogs the app asked for and, on macOS, the documents opened from Finder.
+/// exit), the file dialogs the app asked for, the AI assistant and, on macOS, the documents
+/// opened from Finder.
 struct App(
     WordApp,
     Option<WindowGeometry>,
     Option<control_server::KeyFile>,
     file_dialogs::Launcher,
+    assistant_host::AssistantHost,
     #[cfg(target_os = "macos")] fmv_macos_events::Inbox,
 );
 
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         #[cfg(target_os = "macos")]
-        apple_events::poll(&self.4, &mut self.0, ctx);
+        apple_events::poll(&self.5, &mut self.0, ctx);
+        self.4.frame(ctx, &mut self.0);
         self.0.logic(ctx);
         self.3.show(frame);
         // A window that doesn't fit on its screen (the default size on a laptop) shrinks to fit
@@ -89,10 +93,13 @@ impl eframe::App for App {
         self.0.raw_input_hook(raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.4.panel(ui, &mut self.0);
         self.0.ui(ui);
+        self.4.finish(ui.ctx(), &mut self.0);
         self.3.show(frame);
     }
     fn on_exit(&mut self) {
+        self.4.on_exit();
         print::finish_pending_jobs();
         save_prefs(&self.0);
         if let Some(key_file) = &self.2 {
@@ -250,6 +257,8 @@ fn services(file_dialog: file_dialogs::Hook, ctx: &egui::Context) -> Services {
         set_clipboard_html: Some(Box::new(clipboard::set_html)),
         clipboard_rtf: Some(Box::new(clipboard::rtf)),
         clipboard_formats: Some(Box::new(clipboard::formats)),
+        // The ribbon's Asistente tab (`assistant_host`).
+        host_toolbar: Some(Default::default()),
         ..Default::default()
     }
 }
@@ -317,6 +326,10 @@ fn open_non_unicode(app: &mut WordApp, path: &std::path::Path) {
 }
 
 fn main() -> eframe::Result {
+    // Started by Codex or Claude Code as the assistant's tool server: no window, no log file.
+    if wordcraft_assistant::desktop::maybe_serve_mcp() {
+        return Ok(());
+    }
     // First, so the panic hook and every start-up warning are recorded (`logging`).
     let logger = logging::install();
     logging::install_panic_hook();
@@ -473,6 +486,7 @@ fn main() -> eframe::Result {
                 Some(restored.unwrap_or_default()),
                 key_file,
                 dialogs,
+                assistant_host::AssistantHost::new(),
                 #[cfg(target_os = "macos")]
                 apple_events.connect(&cc.egui_ctx),
             )))
