@@ -82,6 +82,9 @@ pub const MODELS: &[Model] = &[
     Model { id: "gpt-6-astra", label: "GPT-6 Astra", hint: "Máxima capacidad", provider: Provider::OpenAi },
 ];
 
+/// With the ChatGPT plan: no model named, Codex picks the plan's default.
+pub const CODEX_DEFAULT: &str = "codex";
+
 pub fn model(id: &str) -> Option<&'static Model> {
     MODELS.iter().find(|m| m.id == id)
 }
@@ -96,6 +99,9 @@ pub fn provider_of(id: &str) -> Provider {
 }
 
 pub fn label_of(id: &str) -> String {
+    if id == CODEX_DEFAULT {
+        return "Codex (modelo del plan)".into();
+    }
     model(id).map_or_else(|| id.to_owned(), |m| m.label.to_owned())
 }
 
@@ -152,7 +158,15 @@ pub fn system_prompt(app: &str) -> String {
     SYSTEM.replace("{app}", app)
 }
 
-fn tools() -> [Value; 2] {
+/// The same instructions for the desktop app, where file.save writes the open document's file.
+pub fn desktop_system_prompt(app: &str) -> String {
+    system_prompt(app).replace("running natively on an Android tablet", "running natively on the user's computer").replace(
+        "(it writes the app's local copy). Exporting outside the app is the user's action.",
+        "(it saves the open document to its own file). Choosing another file or exporting is the user's action.",
+    )
+}
+
+pub fn tools() -> [Value; 2] {
     [
         json!({"name":"list_commands", "description":"Search the editor's commands by id, feature or label and get their exact parameter documentation. Empty search lists the first page; use offset to page.", "parameters":{"type":"object","properties":{"search":{"type":"string"},"offset":{"type":"integer","minimum":0}},"additionalProperties":false}}),
         json!({"name":"execute_command", "description":"Run one engine command on the open document: inspection, selection, formatting, content edits, undo. Use only ids and parameter names returned by list_commands. file.save with {} saves the local copy. Cannot open, close, export or delete files.", "parameters":{"type":"object","properties":{"command":{"type":"string"},"params":{"type":"object","additionalProperties":true}},"required":["command","params"],"additionalProperties":false}}),
@@ -171,6 +185,42 @@ pub fn user_message(prompt: &str, context: &Value) -> String {
         snapshot.push_str("… [snapshot truncated: read the rest with inspection commands]");
     }
     format!("{prompt}\n\n<document_snapshot>\n{snapshot}\n</document_snapshot>")
+}
+
+/// A user message's content blocks in the provider's format: its files first (as the providers
+/// recommend), then the text.
+pub fn user_content(provider: Provider, text: &str, files: &[Attachment]) -> Value {
+    let mut content: Vec<Value> = files.iter().map(|file| file_block(provider, file)).collect();
+    content.push(match provider {
+        Provider::OpenAi => json!({"type":"input_text","text":text}),
+        Provider::Anthropic => json!({"type":"text","text":text}),
+    });
+    Value::Array(content)
+}
+
+fn file_block(provider: Provider, file: &Attachment) -> Value {
+    let name = &file.name;
+    match (provider, file.kind) {
+        (_, Kind::Text) => {
+            let text = format!("<attached_file name=\"{}\">\n{}\n</attached_file>", name.replace('"', "'"), file.text);
+            match provider {
+                Provider::OpenAi => json!({"type":"input_text","text":text}),
+                Provider::Anthropic => json!({"type":"text","text":text}),
+            }
+        }
+        (Provider::OpenAi, Kind::Image) => {
+            json!({"type":"input_image","image_url":format!("data:{};base64,{}", file.media_type, attach::base64(&file.data)),"detail":"auto"})
+        }
+        (Provider::OpenAi, Kind::Pdf) => {
+            json!({"type":"input_file","filename":name,"file_data":format!("data:application/pdf;base64,{}", attach::base64(&file.data))})
+        }
+        (Provider::Anthropic, Kind::Image) => {
+            json!({"type":"image","source":{"type":"base64","media_type":file.media_type,"data":attach::base64(&file.data)}})
+        }
+        (Provider::Anthropic, Kind::Pdf) => {
+            json!({"type":"document","title":name,"source":{"type":"base64","media_type":"application/pdf","data":attach::base64(&file.data)}})
+        }
+    }
 }
 
 /// One conversation's history in the provider's own format.
@@ -195,37 +245,7 @@ impl Thread {
     /// A user message: its attachments first (as the providers recommend), then the text.
     pub fn push_user(&mut self, text: String, files: &[Attachment]) {
         self.close_pending("Cancelled: the user sent a new message instead.");
-        let mut content: Vec<Value> = files.iter().map(|file| self.file_block(file)).collect();
-        content.push(match self.provider {
-            Provider::OpenAi => json!({"type":"input_text","text":text}),
-            Provider::Anthropic => json!({"type":"text","text":text}),
-        });
-        self.items.push(json!({"role":"user","content":content}));
-    }
-
-    fn file_block(&self, file: &Attachment) -> Value {
-        let name = &file.name;
-        match (self.provider, file.kind) {
-            (_, Kind::Text) => {
-                let text = format!("<attached_file name=\"{}\">\n{}\n</attached_file>", name.replace('"', "'"), file.text);
-                match self.provider {
-                    Provider::OpenAi => json!({"type":"input_text","text":text}),
-                    Provider::Anthropic => json!({"type":"text","text":text}),
-                }
-            }
-            (Provider::OpenAi, Kind::Image) => {
-                json!({"type":"input_image","image_url":format!("data:{};base64,{}", file.media_type, attach::base64(&file.data)),"detail":"auto"})
-            }
-            (Provider::OpenAi, Kind::Pdf) => {
-                json!({"type":"input_file","filename":name,"file_data":format!("data:application/pdf;base64,{}", attach::base64(&file.data))})
-            }
-            (Provider::Anthropic, Kind::Image) => {
-                json!({"type":"image","source":{"type":"base64","media_type":file.media_type,"data":attach::base64(&file.data)}})
-            }
-            (Provider::Anthropic, Kind::Pdf) => {
-                json!({"type":"document","title":name,"source":{"type":"base64","media_type":"application/pdf","data":attach::base64(&file.data)}})
-            }
-        }
+        self.items.push(json!({"role":"user","content":user_content(self.provider, &text, files)}));
     }
 
     /// Answer every unanswered tool call (after a stop) so the history stays valid.
@@ -493,6 +513,13 @@ fn required(value: &Value, key: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_desktop_prompt_names_the_computer_and_its_own_file() {
+        let p = desktop_system_prompt("WordCraft");
+        assert!(p.contains("on the user's computer") && !p.contains("Android"), "{p}");
+        assert!(p.contains("saves the open document to its own file"), "{p}");
+    }
 
     #[test]
     fn blocks_host_operations_but_allows_document_editing() {

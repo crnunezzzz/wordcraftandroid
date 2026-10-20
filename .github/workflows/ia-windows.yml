@@ -1,0 +1,176 @@
+# WordCraft IA for Windows: this fork's build with the AI assistant.
+#
+# Every day (and on demand) it merges the original project (storytold/wordcraft) into main, tests
+# the assistant on the merged code and publishes a new portable Windows build as a GitHub
+# release. The Craft Apps launcher keeps updating the official WordCraft; WordCraft IA is a
+# separate install (see packaging/windows/install-ia.ps1), so those updates never remove the
+# assistant, and this workflow brings the launcher's improvements into WordCraft IA.
+#
+# When the merge needs a person (both sides changed the same lines), nothing is pushed: the
+# workflow opens an issue and the last WordCraft IA release stays the current one.
+#
+# Optional secret SYNC_TOKEN: a personal access token with the `repo` and `workflow` scopes.
+# Without it the merge cannot be pushed when the original project changed its own workflow
+# files (GitHub refuses that to the default token); the issue then says so.
+name: IA Windows
+
+on:
+  schedule:
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ia-windows
+  cancel-in-progress: false
+
+env:
+  APP: wordcraft
+  APP_TITLE: WordCraft
+  UPSTREAM: storytold/wordcraft
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  sync:
+    name: Merge the original project
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Merge upstream main
+        id: merge
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with $UPSTREAM."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/main; then
+            conflicted=$(git diff --name-only --diff-filter=U)
+            # The lock file is regenerated from the merged manifests; anything else needs a person.
+            if [ "$conflicted" = "Cargo.lock" ]; then
+              git checkout --theirs Cargo.lock
+              cargo metadata --format-version 1 > /dev/null
+              git add Cargo.lock
+              git commit --no-edit
+            else
+              git merge --abort
+              printf '%s\n' "$conflicted" > conflicts.txt
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Linux build dependencies
+        if: steps.merge.outputs.changed == 'true'
+        uses: storytold/craft-common-actions/actions/install-linux-deps@main
+      - name: Test the assistant and the app on the merged code
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          cargo test --locked -p "$APP-assistant" --lib
+          cargo check --locked -p "$APP"
+      - name: Push the merge
+        if: steps.merge.outputs.changed == 'true'
+        id: push
+        run: git push origin HEAD:main
+      - name: Open an issue when a person is needed
+        if: steps.merge.outputs.conflict == 'true' || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          title="La sincronización con $UPSTREAM necesita revisión"
+          if [ -f conflicts.txt ]; then
+            body="El proyecto original cambió las mismas líneas que este fork en:
+          $(sed 's/^/- /' conflicts.txt)
+
+          No se publicó una versión nueva: la última de $APP_TITLE IA sigue disponible. Resuelve el conflicto (o pídeselo a Claude) y vuelve a lanzar el workflow «IA Windows»."
+          else
+            body="La fusión con $UPSTREAM, sus pruebas o el envío fallaron: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Si el error dice que falta el permiso «workflow», crea el secreto SYNC_TOKEN (un token personal con los permisos repo y workflow). No se publicó una versión nueva: la última de $APP_TITLE IA sigue disponible."
+          fi
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+  windows:
+    name: Build and publish for Windows
+    needs: sync
+    if: always() && needs.sync.result != 'failure' && (needs.sync.result == 'skipped' || needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Check out craft-fonts
+        shell: bash
+        run: |
+          ref=$(sed -n 's/^ *craft-fonts-ref: *//p' .github/workflows/release.yml | head -n1)
+          if [ -n "$ref" ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
+            git -C craft-fonts checkout "$ref"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ia-windows
+      - name: Test the assistant on Windows
+        run: cargo test --locked -p "$env:APP-assistant" --lib --target x86_64-pc-windows-msvc
+      - name: Build
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p $env:APP -p "$env:APP-cli" --target x86_64-pc-windows-msvc
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq $env:APP | Select-Object -ExpandProperty version
+          $tag = "ia-v$version-$env:GITHUB_RUN_NUMBER"
+          $stage = "dist/$env:APP_TITLE IA"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/$env:APP.exe", "target/x86_64-pc-windows-msvc/release/$env:APP-cli.exe" $stage
+          Copy-Item packaging/windows/install-ia.ps1, packaging/windows/LEEME-IA.txt $stage
+          $zip = "dist/$env:APP_TITLE-IA-$version-windows-x64.zip"
+          Compress-Archive -Path "$stage/*" -DestinationPath $zip
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "${{ steps.package.outputs.tag }}" "${{ steps.package.outputs.zip }}" \
+            --target "$(git rev-parse HEAD)" --latest \
+            --title "$APP_TITLE IA ${{ steps.package.outputs.version }} (compilación ${{ github.run_number }})" \
+            --notes "$APP_TITLE con el asistente de IA para Windows x64, al día con $UPSTREAM.
+
+          Instalar o actualizar: descomprime el zip y ejecuta install-ia.ps1 (clic derecho › Ejecutar con PowerShell). Se instala aparte del $APP_TITLE oficial, así que el launcher de Craft Apps no lo sobrescribe. Tus ajustes y claves se conservan."

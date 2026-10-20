@@ -1,6 +1,6 @@
-//! The assistant panel: state and drawing only. It returns [`Action`]s; the Android host runs
-//! the agent and talks to the platform. Compiles on every target so it can be rendered and
-//! tested off the device (`cargo run -p <app>-android --example assistant_preview`).
+//! The assistant panel: state and drawing only. It returns [`Action`]s; the host (Android or
+//! desktop) runs the agent and talks to the platform. Compiles on every target so it can be
+//! rendered and tested off the device (`cargo run -p <app>-assistant --example assistant_preview`).
 #![forbid(unsafe_code)]
 
 use crate::{
@@ -32,11 +32,48 @@ pub struct Settings {
     /// Empty: the recommended model of whichever provider has a key.
     pub model: String,
     pub effort: String,
+    /// Desktop: OpenAI through the user's ChatGPT plan (their own Codex CLI), not an API key.
+    pub openai_plan: bool,
+    /// Desktop: Claude through the user's Claude plan (their own Claude Code CLI).
+    pub anthropic_plan: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
-        Self { ai: true, model: String::new(), effort: "medium".into() }
+        Self { ai: true, model: String::new(), effort: "medium".into(), openai_plan: false, anthropic_plan: false }
     }
+}
+impl Settings {
+    pub fn plan(&self, provider: Provider) -> bool {
+        match provider {
+            Provider::OpenAi => self.openai_plan,
+            Provider::Anthropic => self.anthropic_plan,
+        }
+    }
+    pub fn set_plan(&mut self, provider: Provider, on: bool) {
+        match provider {
+            Provider::OpenAi => self.openai_plan = on,
+            Provider::Anthropic => self.anthropic_plan = on,
+        }
+    }
+}
+
+/// Where the host runs: the texts about key storage and gestures differ.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Host {
+    #[default]
+    Android,
+    Desktop,
+}
+
+/// What the host found of a plan's command-line tool (Codex, Claude Code).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PlanInfo {
+    /// The check finished (installed and logged_in are known).
+    pub checked: bool,
+    pub installed: bool,
+    pub logged_in: bool,
+    /// The tool's version or what went wrong, as shown under its row.
+    pub detail: String,
 }
 
 /// Interface sizes the settings step through (zoom over the system's own scale).
@@ -93,6 +130,14 @@ pub enum Action {
     RemoveAttachment(usize),
     /// The interface size, as a zoom over the system's scale.
     SetScale(f32),
+    /// Desktop: connect a provider through the user's plan (true) or an API key (false).
+    SetPlan(Provider, bool),
+    /// Desktop: open the plan tool's own sign-in in a console window.
+    PlanLogin(Provider),
+    /// Desktop: open a console that runs the plan tool's official installer.
+    PlanInstall(Provider),
+    /// Desktop: check again whether the plan tools are installed and signed in.
+    PlanRefresh,
 }
 
 /// Work in progress, as the host reports it each frame.
@@ -115,6 +160,11 @@ pub struct Assistant {
     pub key_edits: [String; 2],
     /// Saved keys: [OpenAI, Anthropic], from the Keystore's flags.
     pub keys: [bool; 2],
+    pub host: Host,
+    /// A settings action that failed (saving a key, opening a sign-in), shown in the settings.
+    pub settings_error: Option<String>,
+    /// The plan tools as last checked: [Codex, Claude Code] (desktop only).
+    pub plans: [PlanInfo; 2],
     pub open: bool,
     pub view: View,
     pub prompt: String,
@@ -415,6 +465,24 @@ fn provider_title(provider: Provider) -> &'static str {
     }
 }
 
+/// "Plan de ChatGPT" → "plan de ChatGPT", for the middle of a sentence.
+pub fn lower_first(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|c| c.to_lowercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// The plan, and the official command-line tool the desktop drives to use it.
+pub fn plan_title(provider: Provider) -> (&'static str, &'static str) {
+    match provider {
+        Provider::OpenAi => ("Plan de ChatGPT", "Codex"),
+        Provider::Anthropic => ("Plan de Claude", "Claude Code"),
+    }
+}
+
+pub fn plan_index(provider: Provider) -> usize {
+    key_index(provider)
+}
+
 impl Assistant {
     pub fn new(settings: Settings) -> Self {
         Self { settings, ui_scale: 1.0, ..Default::default() }
@@ -422,6 +490,22 @@ impl Assistant {
 
     pub fn has_key(&self, provider: Provider) -> bool {
         self.keys[key_index(provider)]
+    }
+
+    /// Through the plan (desktop) when chosen there; otherwise with an API key.
+    pub fn uses_plan(&self, provider: Provider) -> bool {
+        self.host == Host::Desktop && self.settings.plan(provider)
+    }
+
+    /// The provider can take a message: its key is saved, or its plan tool is installed (a
+    /// check still running counts: the run itself reports what is missing).
+    pub fn ready(&self, provider: Provider) -> bool {
+        if self.uses_plan(provider) {
+            let plan = &self.plans[key_index(provider)];
+            !plan.checked || plan.installed
+        } else {
+            self.has_key(provider)
+        }
     }
 
     pub fn set_key_flags(&mut self, flags: &serde_json::Value) {
@@ -435,7 +519,7 @@ impl Assistant {
         if !self.settings.model.is_empty() {
             return self.settings.model.clone();
         }
-        let provider = if self.has_key(Provider::Anthropic) || !self.has_key(Provider::OpenAi) { Provider::Anthropic } else { Provider::OpenAi };
+        let provider = if self.ready(Provider::Anthropic) || !self.ready(Provider::OpenAi) { Provider::Anthropic } else { Provider::OpenAi };
         provider.default_model().into()
     }
 
@@ -480,7 +564,7 @@ impl Assistant {
                     self.open = false;
                 }
                 if self.view == View::Chat {
-                    if icon_button(ui, Icon::Gear, "Ajustes y claves de API", palette).clicked() {
+                    if icon_button(ui, Icon::Gear, "Ajustes y conexión", palette).clicked() {
                         self.view = View::Settings;
                     }
                     let new = ui
@@ -514,8 +598,28 @@ impl Assistant {
             ui.spacing_mut().button_padding = vec2(10.0, 8.0);
             for provider in [Provider::Anthropic, Provider::OpenAi] {
                 ui.add_space(4.0);
-                let note = if self.has_key(provider) { "" } else { "  ·  sin clave" };
+                let note = if self.uses_plan(provider) {
+                    match provider {
+                        Provider::OpenAi => "  ·  plan de ChatGPT",
+                        Provider::Anthropic => "  ·  plan de Claude",
+                    }
+                } else if self.has_key(provider) {
+                    ""
+                } else {
+                    "  ·  sin clave"
+                };
                 ui.label(RichText::new(format!("{}{note}", provider_title(provider))).small().color(palette.weak));
+                if provider == Provider::OpenAi && self.uses_plan(provider) {
+                    let row = ui.add_enabled_ui(self.busy.is_none(), |ui| {
+                        let label = RichText::new(protocol::label_of(protocol::CODEX_DEFAULT)).size(14.5);
+                        ui.add(egui::Button::selectable(model == protocol::CODEX_DEFAULT, label).min_size(vec2(ui.available_width(), 34.0)))
+                    });
+                    if row.inner.clicked() {
+                        self.settings.model = protocol::CODEX_DEFAULT.into();
+                        self.actions.push(Action::SaveSettings);
+                        ui.close();
+                    }
+                }
                 for m in MODELS.iter().filter(|m| m.provider == provider) {
                     let row = ui.add_enabled_ui(self.busy.is_none(), |ui| {
                         ui.add(egui::Button::selectable(m.id == model, RichText::new(m.label).size(14.5)).min_size(vec2(ui.available_width(), 34.0)))
@@ -536,7 +640,7 @@ impl Assistant {
                 }
             }
             ui.separator();
-            if ui.add(egui::Button::new("Claves de API y ajustes…").min_size(vec2(ui.available_width(), 34.0))).clicked() {
+            if ui.add(egui::Button::new("Conexión y ajustes…").min_size(vec2(ui.available_width(), 34.0))).clicked() {
                 self.view = View::Settings;
                 ui.close();
             }
@@ -554,6 +658,10 @@ impl Assistant {
         };
         egui::ScrollArea::vertical().id_salt("assistant_settings").auto_shrink([false; 2]).show(ui, |ui| {
             ui.set_width(ui.available_width() - 6.0);
+            if let Some(error) = &self.settings_error {
+                ui.add_space(8.0);
+                ui.add(egui::Label::new(RichText::new(error).color(palette.error)).wrap());
+            }
             section(ui, "Acceso a la IA");
             let before = self.settings.ai;
             egui::ComboBox::from_id_salt("ai_access").width(ui.available_width()).selected_text(if self.settings.ai { "Activado" } else { "Desactivado" }).show_ui(ui, |ui| {
@@ -569,13 +677,37 @@ impl Assistant {
             ui.add_space(4.0);
             note(ui, "Cada mensaje envía tu petición, el contenido del documento abierto y los archivos que adjuntes al proveedor elegido; el asistente lo lee y lo edita con las mismas órdenes que la línea de comandos. «Desactivado» garantiza que ninguna petición sale del dispositivo.");
 
-            section(ui, "Claves de API");
-            note(ui, "Fija un límite de gasto en tu cuenta: esa misma página muestra lo que has usado. Las claves se cifran con el Android Keystore y solo viajan a su proveedor.");
+            let desktop = self.host == Host::Desktop;
+            section(ui, if desktop { "Conexión con la IA" } else { "Claves de API" });
+            note(
+                ui,
+                if desktop {
+                    "Cada proveedor se conecta con una clave de API (pagas por uso) o con tu plan de ChatGPT o de Claude. Con el plan, el asistente usa la herramienta oficial del proveedor (Codex o Claude Code) instalada en este equipo y con tu sesión: la app nunca ve tu contraseña ni tus credenciales. Las claves de API se guardan en el Administrador de credenciales del sistema y solo viajan a su proveedor."
+                } else {
+                    "Fija un límite de gasto en tu cuenta: esa misma página muestra lo que has usado. Las claves se cifran con el Android Keystore y solo viajan a su proveedor."
+                },
+            );
             for provider in [Provider::OpenAi, Provider::Anthropic] {
                 let index = key_index(provider);
                 ui.add_space(12.0);
                 ui.label(RichText::new(provider_title(provider)).color(palette.text));
                 ui.add_space(2.0);
+                if desktop {
+                    let plan = self.settings.plan(provider);
+                    ui.horizontal(|ui| {
+                        for (on, label) in [(false, "Clave de API"), (true, plan_title(provider).0)] {
+                            let button = egui::Button::selectable(plan == on, label).min_size(vec2(120.0, 32.0)).corner_radius(10);
+                            if ui.add_enabled(self.busy.is_none(), button).clicked() && plan != on {
+                                self.actions.push(Action::SetPlan(provider, on));
+                            }
+                        }
+                    });
+                    ui.add_space(4.0);
+                    if plan {
+                        self.plan_row(ui, palette, provider);
+                        continue;
+                    }
+                }
                 let saved = self.has_key(provider);
                 let mut save = false;
                 let mut delete = false;
@@ -632,7 +764,7 @@ impl Assistant {
             });
             note(ui, "Más razonamiento da respuestas más cuidadosas, pero más lentas y caras.");
 
-            section(ui, "Pantalla y gestos");
+            section(ui, if self.host == Host::Desktop { "Pantalla" } else { "Pantalla y gestos" });
             // Steps, not a slider: the whole interface rescales under the finger as it changes.
             let current = self.ui_scale;
             let smaller = SCALES.iter().rev().copied().find(|s| *s < current - 0.01);
@@ -656,7 +788,9 @@ impl Assistant {
                 self.actions.push(Action::SetScale(1.0));
             }
             ui.add_space(4.0);
-            note(ui, "Un dedo desplaza la página · tocar = clic · mantener = menú contextual · mantener y arrastrar = seleccionar · dos dedos = zoom. Ratón, lápiz y trackpad funcionan como en el escritorio; Atrás cierra paneles y menús.");
+            if self.host == Host::Android {
+                note(ui, "Un dedo desplaza la página · tocar = clic · mantener = menú contextual · mantener y arrastrar = seleccionar · dos dedos = zoom. Ratón, lápiz y trackpad funcionan como en el escritorio; Atrás cierra paneles y menús.");
+            }
             ui.add_space(18.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let done = egui::Button::new(RichText::new("Listo").color(palette.on_accent).strong()).fill(palette.accent).corner_radius(12).min_size(vec2(104.0, 42.0));
@@ -667,6 +801,53 @@ impl Assistant {
             });
             ui.add_space(12.0);
         });
+    }
+
+    /// The plan tool's state and the steps that are left: install, sign in.
+    fn plan_row(&mut self, ui: &mut Ui, palette: &Palette, provider: Provider) {
+        let (plan, tool) = plan_title(provider);
+        let info = self.plans[key_index(provider)].clone();
+        Frame::new().fill(palette.card).stroke(Stroke::new(1.0, palette.border)).corner_radius(12).inner_margin(Margin::same(12)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let (mark, color, text) = if !info.checked {
+                ("…", palette.weak, format!("Comprobando {tool}…"))
+            } else if !info.installed {
+                ("✗", palette.error, format!("{tool} no está instalado en este equipo."))
+            } else if !info.logged_in {
+                ("!", palette.error, format!("{tool} está instalado, pero sin sesión iniciada."))
+            } else {
+                ("✓", palette.accent, format!("{tool} listo: los mensajes cuentan en tu {}.", lower_first(plan)))
+            };
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(mark).strong().color(color));
+                ui.add(egui::Label::new(RichText::new(text).color(palette.text)).wrap());
+            });
+            if !info.detail.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&info.detail).small().color(palette.weak)).wrap());
+            }
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                if info.checked && !info.installed && ui.button(format!("Instalar {tool}…")).clicked() {
+                    self.actions.push(Action::PlanInstall(provider));
+                }
+                if info.checked && info.installed && !info.logged_in && ui.button("Iniciar sesión…").clicked() {
+                    self.actions.push(Action::PlanLogin(provider));
+                }
+                if info.checked && ui.button("Comprobar de nuevo").clicked() {
+                    self.actions.push(Action::PlanRefresh);
+                }
+            });
+        });
+        ui.add_space(2.0);
+        let how = match provider {
+            Provider::OpenAi => {
+                "Necesitas un plan de ChatGPT que incluya Codex. «Instalar» abre una ventana con el instalador oficial de OpenAI; «Iniciar sesión» abre el inicio de sesión de Codex en el navegador."
+            }
+            Provider::Anthropic => {
+                "Necesitas un plan de Claude que incluya Claude Code (Pro, Max, Team o Enterprise). «Instalar» abre una ventana con el instalador oficial de Anthropic; «Iniciar sesión» abre el inicio de sesión de Claude Code en el navegador."
+            }
+        };
+        ui.add(egui::Label::new(RichText::new(how).small().color(palette.weak)).wrap());
     }
 
     fn composer(&mut self, ui: &mut Ui, palette: &Palette, brand: &Branding) {
@@ -903,7 +1084,8 @@ impl Assistant {
                                     if index + 1 == count && (*can_retry || *key) {
                                         ui.add_space(6.0);
                                         ui.horizontal(|ui| {
-                                            if *key && ui.button("Añadir clave de API").clicked() {
+                                            let fix = if self.host == Host::Desktop { "Revisar la conexión" } else { "Añadir clave de API" };
+                                            if *key && ui.button(fix).clicked() {
                                                 settings = true;
                                             }
                                             if *can_retry && ui.button("Reintentar").clicked() {

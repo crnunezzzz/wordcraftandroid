@@ -1,0 +1,26 @@
+WordCraft IA — WordCraft con el asistente de IA para Windows
+============================================================
+
+INSTALAR O ACTUALIZAR
+  1. Descomprime todo el zip en una carpeta.
+  2. Clic derecho en install-ia.ps1 › «Ejecutar con PowerShell».
+  3. Abre «WordCraft IA» desde el menú Inicio o el escritorio.
+  (También funciona sin instalar: abre wordcraft.exe desde la carpeta descomprimida.)
+
+  Windows puede avisar de que el programa no está firmado («Windows protegió su PC»):
+  pulsa «Más información» › «Ejecutar de todas formas».
+
+POR QUÉ ES UNA INSTALACIÓN APARTE
+  El launcher de Craft Apps instala y actualiza el WordCraft oficial, que no trae el
+  asistente. WordCraft IA vive en otra carpeta (%LOCALAPPDATA%\Programs\WordCraft IA), así que
+  esas actualizaciones nunca lo borran. Las mejoras del proyecto original llegan a WordCraft IA
+  con las versiones nuevas que se publican en GitHub (Releases del fork): descarga la última
+  y vuelve a ejecutar install-ia.ps1. Ajustes, documentos recientes y claves se conservan.
+
+CONECTAR LA IA (pestaña Asistente › engranaje)
+  - Clave de API de OpenAI o de Anthropic: pagas por uso; la clave se guarda en el
+    Administrador de credenciales de Windows.
+  - Plan de ChatGPT: usa Codex, la herramienta oficial de OpenAI, con tu sesión de ChatGPT.
+  - Plan de Claude: usa Claude Code, la herramienta oficial de Anthropic, con tu sesión de Claude.
+  Con un plan, la app nunca ve tu contraseña ni tus credenciales: «Instalar» y «Iniciar sesión»
+  abren los instaladores y el inicio de sesión oficiales de cada proveedor.

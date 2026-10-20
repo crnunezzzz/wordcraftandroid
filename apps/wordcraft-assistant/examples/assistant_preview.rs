@@ -2,9 +2,9 @@
 //! design can be checked without a tablet: closed (floating button), empty, a conversation,
 //! an error, the settings, attached files, and a narrow phone-sized window.
 //!
-//! `cargo run -p wordcraft-android --example assistant_preview -- /abs/out/dir`
-use wordcraft_android::assistant::{Assistant, Busy, Chip, Entry, Step, View};
-use wordcraft_android::attach;
+//! `cargo run -p wordcraft-assistant --example assistant_preview -- /abs/out/dir`
+use wordcraft_assistant::assistant::{Assistant, Busy, Chip, Entry, Host, PlanInfo, Step, View};
+use wordcraft_assistant::attach;
 use wordcraft_engine::Session;
 use wordcraft_ui_egui::{Services, WordApp};
 
@@ -67,6 +67,37 @@ fn scenario(name: &str) -> Assistant {
                 .collect();
             a.attach_error = Some("«video.mp4» no es una imagen, un PDF ni un documento de texto que se pueda leer.".into());
         }
+        "desktop-plans" => {
+            a.host = Host::Desktop;
+            a.view = View::Settings;
+            a.settings.openai_plan = true;
+            a.settings.anthropic_plan = true;
+            a.plans = [
+                PlanInfo { checked: true, installed: true, logged_in: true, detail: "codex-cli 0.131.0 · Sesión con tu cuenta de ChatGPT.".into() },
+                PlanInfo { checked: true, installed: false, logged_in: false, detail: String::new() },
+            ];
+        }
+        "desktop-mixed" => {
+            a.host = Host::Desktop;
+            a.view = View::Settings;
+            a.settings.anthropic_plan = true;
+            a.plans[1] = PlanInfo { checked: true, installed: true, logged_in: false, detail: "2.4.1 (Claude Code)".into() };
+        }
+        "desktop-chat" => {
+            a.host = Host::Desktop;
+            a.settings.anthropic_plan = true;
+            a.settings.model = "claude-sonnet-5-5".into();
+            a.plans[1] = PlanInfo { checked: true, installed: true, logged_in: true, detail: String::new() };
+            a.entries = vec![
+                Entry::User { text: "Convierte la lista de servicios en una tabla de dos columnas.".into(), files: vec![] },
+                Entry::Steps(vec![
+                    Step { label: "Buscó órdenes: «table»".into(), ok: true, detail: String::new() },
+                    Step { label: "Insert Table (table.insert)".into(), ok: true, detail: String::new() },
+                ]),
+                Entry::Assistant("Listo: la lista ahora es una tabla con **Servicio** y **Descripción**.".into()),
+                Entry::Error { text: "Has alcanzado el límite de uso de tu plan por ahora. Espera a que se renueve o usa una clave de API.\nClaude AI usage limit reached".into(), retry: true, key: false },
+            ];
+        }
         _ => {}
     }
     a
@@ -75,7 +106,11 @@ fn scenario(name: &str) -> Assistant {
 fn main() {
     let out = std::path::PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "target/assistant-preview".into()));
     let _ = std::fs::create_dir_all(&out);
-    for name in ["closed", "empty", "conversation", "error", "settings", "attachments", "phone"] {
+    let only: Vec<String> = std::env::args().skip(2).collect();
+    for name in ["closed", "empty", "conversation", "error", "settings", "attachments", "phone", "desktop-plans", "desktop-mixed", "desktop-chat"] {
+        if !only.is_empty() && !only.iter().any(|o| o == name) {
+            continue;
+        }
         let size = if name == "phone" { egui::vec2(700.0, 1100.0) } else { egui::vec2(1440.0, 900.0) };
         let services = Services { host_toolbar: Some(Default::default()), ..Default::default() };
         let app = WordApp::new(Session::new(wordcraft_engine::sample::sample_document()), services);
@@ -90,7 +125,7 @@ fn main() {
                 }
                 s.app.logic(&ctx);
                 if s.assistant.open {
-                    s.assistant.panel(ui, &wordcraft_android::BRANDING);
+                    s.assistant.panel(ui, &wordcraft_assistant::BRANDING);
                 }
                 s.app.ui(ui);
                 s.assistant.launcher(&ctx);

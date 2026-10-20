@@ -495,6 +495,8 @@ impl Mobile {
                     Ok(flags) => self.assistant.set_key_flags(&flags),
                     Err(e) => self.status = e,
                 },
+                // Connecting through a plan's command-line tool is for the desktop only.
+                Action::SetPlan(..) | Action::PlanLogin(_) | Action::PlanInstall(_) | Action::PlanRefresh => {}
                 Action::Attach => self.attach(),
                 Action::PasteImage => self.paste_image(),
                 Action::RemoveAttachment(index) => {
