@@ -1,13 +1,18 @@
-//! «Actualizar» on Windows: download the new build's zip, unpack the program files, and hand
-//! them to a small PowerShell helper that waits for this window to close, copies them over this
-//! copy and opens it again.
+//! «Actualizar» on Windows and Linux: download the new build's zip, unpack the program files
+//! and put them in place of this copy, then open the app again once this window has closed.
+//!
+//! - Windows locks a running program's file, so a small PowerShell helper waits for this window
+//!   to close, copies the files over this copy and opens it again.
+//! - Linux lets a running program's file be replaced (this process keeps the old one until it
+//!   exits), so the files are swapped in at once and a small shell helper only waits to reopen.
 //!
 //! The window closes through the app's own close path, so a document with unsaved changes asks
-//! first; if the user cancels, the helper keeps waiting and installs when the app is closed.
+//! first; if the user cancels, the new build is used the next time the app is opened.
 //! Only the release's own files on GitHub are downloaded (the address [`crate::update::latest`]
 //! accepted), and only the program files named below are taken from the zip.
 #![forbid(unsafe_code)]
 
+use crate::update::Target;
 use std::{
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -20,6 +25,15 @@ const MAX_DOWNLOAD: u64 = 600 * 1024 * 1024;
 /// Where the helper leaves a failure for the next start to show.
 pub const REPORT: &str = "update-error.txt";
 
+/// Whether «Actualizar» installs the build itself here; elsewhere it opens the download.
+pub const SUPPORTED: bool = cfg!(any(windows, target_os = "linux"));
+
+/// The files an update replaces: the app, its command line and the readme.
+fn program_files(exe: &str) -> [String; 3] {
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    [format!("{exe}{ext}"), format!("{exe}-cli{ext}"), "LEEME-IA.txt".to_owned()]
+}
+
 /// What the download worker reports.
 pub enum Msg {
     Progress(u64, Option<u64>),
@@ -31,7 +45,8 @@ pub enum Msg {
 /// The program's own name ("wordcraft") and folder, which the update replaces.
 pub fn this_copy() -> Result<(String, PathBuf), String> {
     let exe = std::env::current_exe().map_err(|_| "No se encontró el programa en ejecución.".to_owned())?;
-    let stem = exe.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()).map(str::to_owned);
+    // Linux names a program whose file was replaced "<path> (deleted)".
+    let stem = exe.file_stem().and_then(|s| s.to_str()).map(|s| s.trim_end_matches(" (deleted)")).filter(|s| !s.is_empty()).map(str::to_owned);
     match (stem, exe.parent()) {
         (Some(stem), Some(dir)) => Ok((stem, dir.to_owned())),
         _ => Err("No se encontró el programa en ejecución.".into()),
@@ -48,7 +63,7 @@ pub fn download(url: &str, work: &Path, exe: &str, tx: &Sender<Msg>) {
 }
 
 fn fetch(url: &str, work: &Path, tx: &Sender<Msg>) -> Result<PathBuf, String> {
-    if !url.starts_with("https://github.com/") || !url.ends_with("-windows-x64.zip") {
+    if !url.starts_with("https://github.com/") || !Target::DESKTOP.is_some_and(|t| url.ends_with(t.suffix())) {
         return Err("La dirección de la descarga no es de GitHub.".into());
     }
     let offline = |_| "No se pudo descargar la versión nueva: revisa la conexión.".to_owned();
@@ -100,7 +115,7 @@ fn fetch(url: &str, work: &Path, tx: &Sender<Msg>) -> Result<PathBuf, String> {
 /// Anything else in the archive is ignored.
 fn unpack(zip: &Path, dest: &Path, exe: &str) -> Result<PathBuf, String> {
     let broken = || "El archivo descargado está dañado: vuelve a intentarlo.".to_owned();
-    let wanted = [format!("{exe}.exe"), format!("{exe}-cli.exe"), "LEEME-IA.txt".to_owned()];
+    let wanted = program_files(exe);
     let file = std::fs::File::open(zip).map_err(|_| broken())?;
     let mut archive = zip::ZipArchive::new(file).map_err(|_| broken())?;
     std::fs::create_dir_all(dest).map_err(|e| format!("No se pudo preparar la carpeta de la descarga ({e})."))?;
@@ -114,10 +129,16 @@ fn unpack(zip: &Path, dest: &Path, exe: &str) -> Result<PathBuf, String> {
         }
         let mut out = std::fs::File::create(dest.join(&name)).map_err(|e| format!("No se pudo descomprimir la descarga ({e})."))?;
         std::io::copy(&mut (&mut entry).take(MAX_DOWNLOAD), &mut out).map_err(|_| broken())?;
+        #[cfg(unix)]
+        if !name.ends_with(".txt") {
+            use std::os::unix::fs::PermissionsExt;
+            out.set_permissions(std::fs::Permissions::from_mode(0o755)).map_err(|e| format!("No se pudo descomprimir la descarga ({e})."))?;
+        }
         found.push(name);
     }
-    if !found.iter().any(|n| n.eq_ignore_ascii_case(&format!("{exe}.exe"))) {
-        return Err(format!("La descarga no trae {exe}.exe."));
+    let [app, ..] = &wanted;
+    if !found.iter().any(|n| n.eq_ignore_ascii_case(app)) {
+        return Err(format!("La descarga no trae {app}."));
     }
     Ok(dest.to_owned())
 }
@@ -180,9 +201,55 @@ pub fn launch(staged: &Path, exe: &str, dest: &Path, report: &Path) -> Result<()
     start(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| start(CREATE_NO_WINDOW)).map(drop).map_err(failed)
 }
 
-#[cfg(not(windows))]
+/// Waits for the process `$1` to end and opens `$3/$2` again (unless that was much later,
+/// when the user is likely done with it).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const REOPEN: &str = r#"started=$(date +%s)
+while kill -0 "$1" 2>/dev/null; do sleep 0.5; done
+if [ $(( $(date +%s) - started )) -lt 600 ]; then cd "$3" && exec "./$2"; fi"#;
+
+/// Put the files in `staged` in place of this copy and start the helper that reopens it. The
+/// caller then closes the window.
+#[cfg(target_os = "linux")]
+pub fn launch(staged: &Path, exe: &str, dest: &Path, _report: &Path) -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    let names: Vec<String> = program_files(exe).into_iter().filter(|name| staged.join(name).is_file()).collect();
+    // Every file is copied beside its target first and then renamed over it, so a failure
+    // (a full disk, a folder the user cannot write) leaves this copy as it was.
+    let temp = |name: &str| dest.join(format!(".{name}.update"));
+    let cleanup = || names.iter().for_each(|name| drop(std::fs::remove_file(temp(name))));
+    for name in &names {
+        if let Err(e) = std::fs::copy(staged.join(name), temp(name)) {
+            cleanup();
+            return Err(format!("No se pudo copiar la versión nueva en {} ({e}). Instálala con install-ia.sh desde el zip.", dest.display()));
+        }
+    }
+    for name in &names {
+        if let Err(e) = std::fs::rename(temp(name), dest.join(name)) {
+            cleanup();
+            return Err(format!("No se pudo reemplazar {name} en {} ({e}). Instálala con install-ia.sh desde el zip.", dest.display()));
+        }
+    }
+    let _ = std::fs::remove_dir_all(staged.parent().unwrap_or(staged));
+    // In a process group of its own, so closing the app cannot end the helper with it.
+    std::process::Command::new("sh")
+        .args(["-c", REOPEN, "sh"])
+        .arg(std::process::id().to_string())
+        .arg(exe)
+        .arg(dest)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(drop)
+        // The new build is already in place: it opens the next time the app is started.
+        .or(Ok(()))
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn launch(_staged: &Path, _exe: &str, _dest: &Path, _report: &Path) -> Result<(), String> {
-    Err("La instalación automática es solo para Windows.".into())
+    Err("La instalación automática es solo para Windows y Linux.".into())
 }
 
 #[cfg(test)]
@@ -205,15 +272,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let zip = dir.join("update.zip");
+        let [app, cli, readme] = program_files("wordcraft");
+        let inside = |name: &str| format!("WordCraft IA/{name}");
         std::fs::write(
             &zip,
             zip_with(&[
                 ("WordCraft IA/", b""),
-                ("WordCraft IA/wordcraft.exe", b"new app"),
-                ("WordCraft IA/wordcraft-cli.exe", b"new cli"),
-                ("WordCraft IA/LEEME-IA.txt", b"readme"),
+                (&inside(&app), b"new app"),
+                (&inside(&cli), b"new cli"),
+                (&inside(&readme), b"readme"),
                 ("WordCraft IA/install-ia.ps1", b"script"),
-                ("../wordcraft.exe", b"escape"),
+                ("WordCraft IA/install-ia.sh", b"script"),
+                (&format!("../{app}"), b"escape"),
                 ("WordCraft IA/other.dll", b"dll"),
             ]),
         )
@@ -221,8 +291,15 @@ mod tests {
         let dest = unpack(&zip, &dir.join("new"), "wordcraft").unwrap();
         let mut names: Vec<_> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
         names.sort();
-        assert_eq!(names, ["LEEME-IA.txt", "wordcraft-cli.exe", "wordcraft.exe"]);
-        assert_eq!(std::fs::read(dest.join("wordcraft.exe")).unwrap(), b"new app");
+        let mut expected = vec![app.clone(), cli, readme];
+        expected.sort();
+        assert_eq!(names, expected);
+        assert_eq!(std::fs::read(dest.join(&app)).unwrap(), b"new app");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dest.join(&app)).unwrap().permissions().mode() & 0o111, 0o111, "the program can run");
+        }
         // Another app's zip is refused rather than half-installed.
         assert!(unpack(&zip, &dir.join("other"), "deckcraft").is_err());
         std::fs::write(&zip, b"not a zip").unwrap();
@@ -237,6 +314,40 @@ mod tests {
         }
         // The files it copies are the ones `unpack` keeps.
         assert!(HELPER.contains(r#""$App.exe", "$App-cli.exe", 'LEEME-IA.txt'"#));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_swaps_the_files_in_and_reopens_after_exit() {
+        let dir = std::env::temp_dir().join(format!("craft-install-linux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (staged, dest) = (dir.join("work").join("new"), dir.join("WordCraft IA"));
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        std::fs::write(staged.join("wordcraft"), b"new app").unwrap();
+        std::fs::write(staged.join("LEEME-IA.txt"), b"new readme").unwrap();
+        std::fs::write(dest.join("wordcraft"), b"old app").unwrap();
+        std::fs::write(dest.join("wordcraft-cli"), b"old cli").unwrap();
+        launch(&staged, "wordcraft", &dest, &dir.join(REPORT)).unwrap();
+        assert_eq!(std::fs::read(dest.join("wordcraft")).unwrap(), b"new app");
+        assert_eq!(std::fs::read(dest.join("LEEME-IA.txt")).unwrap(), b"new readme");
+        // A file the build does not bring stays as it was; no temporary files are left behind.
+        assert_eq!(std::fs::read(dest.join("wordcraft-cli")).unwrap(), b"old cli");
+        let mut names: Vec<_> = std::fs::read_dir(&dest).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["LEEME-IA.txt", "wordcraft", "wordcraft-cli"]);
+        assert!(!dir.join("work").exists(), "the download is cleaned up");
+        // A folder that cannot be written leaves the old copy and says so.
+        std::fs::create_dir_all(&staged).unwrap();
+        std::fs::write(staged.join("wordcraft"), b"newer app").unwrap();
+        assert!(launch(&staged, "wordcraft", &dir.join("missing"), &dir.join(REPORT)).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_reopen_helper_waits_for_the_app_to_end() {
+        // $1 the process, $2 the program, $3 its folder: the order `launch` passes them.
+        assert!(REOPEN.contains(r#"kill -0 "$1""#) && REOPEN.contains(r#"cd "$3" && exec "./$2""#));
     }
 
     #[test]

@@ -149,14 +149,14 @@ impl Desktop {
         desktop
     }
 
-    /// «Actualizar»: download and unpack the new build off the UI thread (Windows); elsewhere,
-    /// open its file in the browser.
+    /// «Actualizar»: download and unpack the new build off the UI thread (Windows, Linux);
+    /// elsewhere, open its file in the browser.
     fn install_update(&mut self) {
         let Some(release) = &self.assistant.update else { return };
         if self.assistant.installing.is_some() {
             return;
         }
-        if !cfg!(windows) {
+        if !install::SUPPORTED {
             if let Err(e) = open::that_detached(&release.download) {
                 self.assistant.update_status = Some(format!("No se pudo abrir el navegador ({e}). Descárgala desde {}", release.page));
             }
@@ -241,13 +241,14 @@ impl Desktop {
     /// Look for a newer published build off the UI thread.
     fn check_update(&mut self) {
         let Some(url) = update::api_url(update::repo(crate::RELEASES)) else { return };
+        // No build is published for this system.
+        let Some(target) = update::Target::DESKTOP else { return };
         self.assistant.update_checking = true;
         self.assistant.settings.update_checked = unix_now();
         self.save_settings();
         let tx = self.updates.0.clone();
         let spawned = std::thread::Builder::new().name("craft-update-check".into()).spawn(move || {
-            let result =
-                http::releases(&url).map(|reply| update::latest(&reply, update::repo(crate::RELEASES), update::Target::Windows, update::build()));
+            let result = http::releases(&url).map(|reply| update::latest(&reply, update::repo(crate::RELEASES), target, update::build()));
             let _ = tx.send(result);
         });
         if spawned.is_err() {

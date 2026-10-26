@@ -1,8 +1,8 @@
-# WordCraft IA for Windows and Android: this fork's build with the AI assistant.
+# WordCraft IA for Windows, Linux (Ubuntu) and Android: this fork's build with the AI assistant.
 #
 # Every day (and on demand) it merges the original project (storytold/wordcraft) into main, tests
-# the assistant on the merged code and publishes a new portable Windows build, and the signed
-# Android APK, as one GitHub release. Both apps look for these releases and offer the new build
+# the assistant on the merged code and publishes a new portable Windows build, a Linux x64 build
+# (packaging/linux/install-ia.sh) and the signed Android APK, as one GitHub release. Both apps look for these releases and offer the new build
 # («Hay una versión nueva»). The Craft Apps launcher keeps updating the official WordCraft; WordCraft IA is a
 # separate install (see packaging/windows/install-ia.ps1), so those updates never remove the
 # assistant, and this workflow brings the launcher's improvements into WordCraft IA.
@@ -177,6 +177,53 @@ jobs:
           path: dist/*.zip
           retention-days: 3
 
+  linux:
+    name: Build for Linux
+    needs: sync
+    if: always() && needs.sync.result != 'failure' && (needs.sync.result == 'skipped' || needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch')
+    # The oldest supported Ubuntu, so the program runs on 22.04 and everything newer (glibc).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Check out craft-fonts
+        run: |
+          ref=$(sed -n 's/^ *craft-fonts-ref: *//p' .github/workflows/release.yml | head -n1)
+          if [ -n "$ref" ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
+            git -C craft-fonts checkout "$ref"
+          fi
+      - name: Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-linux-deps@main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ia-linux
+      - name: Test the assistant on Linux
+        run: cargo test --locked -p "$APP-assistant" --lib
+      - name: Build
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: cargo build --release --locked -p "$APP" -p "$APP-cli"
+      - name: Package
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg app "$APP" '.packages[] | select(.name == $app) | .version')
+          stage="dist/$APP_TITLE IA"
+          mkdir -p "$stage"
+          install -m755 "target/release/$APP" "target/release/$APP-cli" "$stage/"
+          strip "$stage/$APP" "$stage/$APP-cli"
+          install -m755 packaging/linux/install-ia.sh "$stage/"
+          install -m644 packaging/linux/LEEME-IA.txt "$stage/"
+          install -m644 "assets/app-icon/hicolor/256x256/apps/ai.storyteller.$APP.png" "$stage/$APP-ia.png"
+          (cd dist && zip -r -X "$APP_TITLE-IA-$version-linux-x64.zip" "$APP_TITLE IA")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ia-linux
+          path: dist/*.zip
+          retention-days: 3
+
   android:
     name: Build the signed Android APK
     needs: sync
@@ -245,7 +292,7 @@ jobs:
 
   publish:
     name: Publish the release
-    needs: [windows, android]
+    needs: [windows, linux, android]
     if: always() && needs.windows.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -262,6 +309,11 @@ jobs:
           SHA: ${{ needs.windows.outputs.sha }}
         run: |
           ls -l dist
+          if ls dist/*-linux-x64.zip > /dev/null 2>&1; then
+            linux="Ubuntu / Linux: descomprime el zip -linux-x64 y, en una terminal dentro de la carpeta, ejecuta sh install-ia.sh."
+          else
+            linux="Esta versión no trae la compilación de Linux (falló su compilación)."
+          fi
           if ls dist/*.apk > /dev/null 2>&1; then
             android="Android: descarga el .apk en el teléfono o la tablet y ábrelo para instalarlo encima del anterior."
           else
@@ -272,7 +324,9 @@ jobs:
             --title "$APP_TITLE IA $VERSION (compilación $GITHUB_RUN_NUMBER)" \
             --notes "$APP_TITLE con el asistente de IA, al día con $UPSTREAM.
 
-          Windows: descomprime el zip y ejecuta install-ia.ps1 (clic derecho › Ejecutar con PowerShell). Se instala aparte del $APP_TITLE oficial, así que el launcher de Craft Apps no lo sobrescribe.
+          Windows: descomprime el zip -windows-x64 y ejecuta install-ia.ps1 (clic derecho › Ejecutar con PowerShell). Se instala aparte del $APP_TITLE oficial, así que el launcher de Craft Apps no lo sobrescribe.
+
+          $linux
 
           $android
 

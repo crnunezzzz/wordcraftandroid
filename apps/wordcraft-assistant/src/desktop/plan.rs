@@ -234,9 +234,18 @@ pub fn open_install(provider: Provider) -> Result<(), String> {
     }
     #[cfg(not(windows))]
     {
+        // npm installs into ~/.local (where `locate` looks), so it needs no administrator.
         let script = match provider {
-            Provider::Anthropic => "curl -fsSL https://claude.ai/install.sh | bash",
-            Provider::OpenAi => "npm install -g @openai/codex",
+            // Ubuntu's desktop comes with wget but not always curl.
+            Provider::Anthropic => {
+                "if command -v curl >/dev/null; then curl -fsSL https://claude.ai/install.sh | bash; \
+                 else wget -qO- https://claude.ai/install.sh | bash; fi"
+            }
+            Provider::OpenAi => {
+                "if command -v npm >/dev/null; then npm install -g --prefix \"$HOME/.local\" @openai/codex; \
+                 else echo 'Codex se instala con npm, que no está instalado.'; \
+                 echo 'En Ubuntu: sudo apt install nodejs npm  y luego pulsa Instalar otra vez.'; fi"
+            }
         };
         visible("sh", &["-c", script])
     }
@@ -265,11 +274,24 @@ fn visible(program: &str, args: &[&str]) -> Result<(), String> {
     #[cfg(all(not(windows), not(target_os = "macos")))]
     {
         let line = std::iter::once(program).chain(args.iter().copied()).map(shell_quote).collect::<Vec<_>>().join(" ");
-        Command::new("x-terminal-emulator")
-            .args(["-e", "sh", "-c", &format!("{line}; echo; read -r -p 'Pulsa Intro para cerrar' _")])
-            .spawn()
-            .map(|_| ())
-            .map_err(|_| format!("Abre una terminal y ejecuta: {line}"))
+        // `sh` is dash on Ubuntu: plain `read`, no bash options.
+        let script = format!("{line}; echo; printf 'Pulsa Intro para cerrar esta ventana. '; read _");
+        // Ubuntu's terminals first (GNOME Terminal; Ptyxis from 25.10), then the usual others.
+        let terminals: [(&str, &[&str]); 6] = [
+            ("gnome-terminal", &["--"]),
+            ("ptyxis", &["--"]),
+            ("x-terminal-emulator", &["-e"]),
+            ("konsole", &["-e"]),
+            ("xfce4-terminal", &["-x"]),
+            ("xterm", &["-e"]),
+        ];
+        let started = terminals.iter().any(|(terminal, flag)| {
+            let mut command = Command::new(terminal);
+            command.args(*flag).args(["sh", "-c", &script]);
+            clean_env(&mut command);
+            command.spawn().is_ok()
+        });
+        if started { Ok(()) } else { Err(format!("No se encontró una terminal. Abre una y ejecuta: {line}")) }
     }
 }
 

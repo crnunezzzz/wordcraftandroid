@@ -1,8 +1,8 @@
 # WordCraft IA para Windows
 
-> Estado · 2026-10-20: primera versión de escritorio del asistente (Windows x64; también compila en
-> macOS y Linux), con aviso de versiones nuevas en Windows y Android. Las pruebas automáticas
-> pasan; falta probarla a mano en un PC con Windows.
+> Estado · 2026-10-26: asistente de escritorio en Windows x64 y Ubuntu / Linux x64 (también
+> compila en macOS), con aviso de versiones nuevas y «Actualizar» en un toque en Windows, Linux y
+> Android. Las pruebas automáticas pasan; falta probar Linux a mano en un PC con Ubuntu.
 
 WordCraft IA es WordCraft con el asistente de IA de la versión Android, en el escritorio. El
 asistente se abre desde la pestaña **Asistente** de la cinta. Lee el documento abierto y lo edita
@@ -58,8 +58,8 @@ los sobrescribiría. Por eso WordCraft IA:
 2. **Recibe las mejoras del proyecto original** con el workflow
    [`ia-windows.yml`](../.github/workflows/ia-windows.yml). Cada día fusiona
    `storytold/wordcraft` en `main`, prueba el asistente sobre el código fusionado y publica una
-   versión nueva en *Releases*: el zip de Windows y la APK firmada de Android en la misma
-   versión. Si el proyecto original cambia las mismas líneas que este fork,
+   versión nueva en *Releases*: el zip de Windows, el zip de Linux y la APK firmada de Android
+   en la misma versión. Si el proyecto original cambia las mismas líneas que este fork,
    no se publica nada: el workflow abre un issue y la última versión sigue disponible.
 3. **Toca lo mínimo del código original**, para que esas fusiones casi nunca choquen:
    - todo el asistente vive en `apps/wordcraft-assistant` (compartido con Android);
@@ -68,7 +68,7 @@ los sobrescribiría. Por eso WordCraft IA:
 
 ### Aviso de versión nueva
 
-Las dos apps (Windows y Android) consultan dos veces al día la lista pública de versiones del
+Las apps (Windows, Linux y Android) consultan dos veces al día la lista pública de versiones del
 repositorio en GitHub. No se envía nada del usuario: es la misma lista que se ve en *Releases*.
 Si hay una compilación más nueva que la instalada, aparece el aviso «Hay una versión nueva» con
 **Actualizar** y **Ahora no** (no vuelve a avisar de esa compilación). En el asistente ›
@@ -81,6 +81,12 @@ engranaje › **Actualizaciones** se puede desactivar el aviso o buscar al momen
   cierre, la versión nueva se instala al cerrar la app. Si no se pudo reemplazar el programa
   (por ejemplo, porque estaba en una carpeta sin permiso de escritura), la próxima vez que se
   abre la app lo dice en el aviso, junto con «Reintentar».
+- **Linux:** «Actualizar» descarga el zip `-linux-x64.zip` y saca de él solo `wordcraft`,
+  `wordcraft-cli` y `LEEME-IA.txt`. Linux deja reemplazar el archivo de un programa abierto, así que
+  los pone en su sitio al momento (primero los copia al lado y luego los renombra, para que un
+  fallo deje la copia anterior intacta). Después la app se cierra por su camino normal y un
+  pequeño script de `sh` la vuelve a abrir cuando terminó. Si se cancela el cierre, la versión
+  nueva se usa la próxima vez que se abra.
 - **Android:** «Actualizar» descarga la APK dentro de la app y se la pasa al instalador de
   Android (`PackageInstaller`), que muestra su ventana: se pulsa «Actualizar» y listo. La primera
   vez Android pide activar «Permitir de esta fuente» para la app; al volver, la instalación sigue
@@ -100,8 +106,29 @@ versión publicada. El código está en `apps/wordcraft-assistant/src/update.rs`
 - Para la APK de Android: crea los secretos **ANDROID_KEYSTORE_BASE64** (el archivo
   `craft-release.p12` en base64) y **ANDROID_KEYSTORE_PASSWORD** (su contraseña). Tiene que ser la
   misma clave con la que se firmaron las APK que ya tienes instaladas; si no, Android no deja
-  instalar encima. Sin estos secretos, la versión solo trae el zip de Windows.
+  instalar encima. Sin estos secretos, la versión solo trae los zip de Windows y Linux.
 - Para publicar una versión al momento: *Actions* › «IA Windows» › *Run workflow*.
+
+## Ubuntu (Linux)
+
+Cada versión trae `WordCraft-IA-<versión>-linux-x64.zip`, compilado en Ubuntu 22.04, así que funciona
+en 22.04 y en todas las posteriores. Para instalarlo:
+
+1. Descomprime el zip (clic derecho › «Extraer aquí»).
+2. En la carpeta «WordCraft IA», clic derecho › «Abrir en una terminal» y ejecuta `sh install-ia.sh`.
+
+El script copia el programa a `~/.local/opt/wordcraft-ia` y añade «WordCraft IA» al menú de
+aplicaciones (y al escritorio, si lo hay), con su icono y los tipos de archivo para «Abrir con».
+También deja el comando `wordcraft-ia` en `~/.local/bin`. No necesita `sudo`, y un WordCraft oficial
+(deb, AppImage, Flatpak) puede convivir con él.
+
+- **Claves de API:** en Linux se guardan en `~/.config/wordcraft/assistant-keys.json`, con permisos
+  `600` (solo tu usuario puede leerlas).
+- **Plan de ChatGPT / Claude:** «Instalar» e «Iniciar sesión» abren una terminal (GNOME Terminal,
+  Ptyxis, Konsole, xterm…). Claude Code se instala con su instalador oficial (`curl` o `wget`).
+  Codex se instala con `npm` en `~/.local`, sin `sudo`; si falta npm, la terminal indica
+  `sudo apt install nodejs npm`. La app busca ambos programas en `~/.local/bin` aunque no estén en
+  el `PATH` del menú de aplicaciones.
 
 ## Desarrollo
 
@@ -109,6 +136,8 @@ versión publicada. El código está en `apps/wordcraft-assistant/src/update.rs`
   de la vía con plan, con una CLI falsa que edita el documento a través del puente.
 - Vista previa del panel sin ventana:
   `cargo run -p wordcraft-assistant --example assistant_preview -- <carpeta> desktop-plans desktop-chat`.
+- Compilación para Linux: `cargo build --release -p wordcraft -p wordcraft-cli`, y empaquetar como el
+  job `linux` del workflow.
 - Compilación cruzada desde Linux:
   `cargo build --release -p wordcraft -p wordcraft-cli --target x86_64-pc-windows-gnu`.
   Necesita MinGW. Las versiones publicadas usan MSVC en `windows-latest`.

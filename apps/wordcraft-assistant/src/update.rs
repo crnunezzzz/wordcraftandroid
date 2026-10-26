@@ -1,13 +1,13 @@
 //! «Hay una versión nueva»: which published build of this fork is newer than the running one.
 //!
 //! The `IA Windows` workflow publishes each build as a GitHub release tagged
-//! `ia-v<version>-<build>`, with the Windows zip and (when the signing key is set up) the
-//! Android APK. Builds from the workflow carry their number (`CRAFT_IA_BUILD`) and repository
+//! `ia-v<version>-<build>`, with the Windows and Linux zips and (when the signing key is set
+//! up) the Android APK. Builds from the workflow carry their number (`CRAFT_IA_BUILD`) and repository
 //! (`CRAFT_IA_REPO`); a local build has number 0, so any published build is newer.
 //!
 //! The hosts fetch [`api_url`] themselves (desktop: HTTPS here; Android: Java) and hand the
-//! reply to [`latest`]. «Actualizar» then installs the file: on Windows the desktop host
-//! replaces this copy and reopens it (`desktop::install`); on Android Java hands the APK to the
+//! reply to [`latest`]. «Actualizar» then installs the file: on Windows and Linux the desktop
+//! host replaces this copy and reopens it (`desktop::install`); on Android Java hands the APK to the
 //! system's installer, which asks the user to confirm.
 #![forbid(unsafe_code)]
 
@@ -23,14 +23,30 @@ pub const MAX_REPLY: usize = 4 * 1024 * 1024;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Target {
     Windows,
+    Linux,
     Android,
 }
 impl Target {
-    fn wants(self, name: &str) -> bool {
+    /// The desktop build this program installs, if one is published for its system.
+    pub const DESKTOP: Option<Target> = if cfg!(windows) {
+        Some(Target::Windows)
+    } else if cfg!(target_os = "linux") {
+        Some(Target::Linux)
+    } else {
+        None
+    };
+
+    /// The end of the file name this target installs.
+    pub fn suffix(self) -> &'static str {
         match self {
-            Target::Windows => name.ends_with("-windows-x64.zip"),
-            Target::Android => name.ends_with(".apk"),
+            Target::Windows => "-windows-x64.zip",
+            Target::Linux => "-linux-x64.zip",
+            Target::Android => ".apk",
         }
+    }
+
+    fn wants(self, name: &str) -> bool {
+        name.ends_with(self.suffix())
     }
 }
 
@@ -139,7 +155,10 @@ mod tests {
     fn the_newest_build_with_a_file_for_the_platform_wins() {
         let reply = json!([
             release("ia-v0.8.1-12", &["WordCraft-IA-0.8.1-windows-x64.zip"]),
-            release("ia-v0.8.1-14", &["WordCraft-IA-0.8.1-windows-x64.zip", "WordCraft-IA-0.8.1-Android-arm64.apk"]),
+            release(
+                "ia-v0.8.1-14",
+                &["WordCraft-IA-0.8.1-windows-x64.zip", "WordCraft-IA-0.8.1-Android-arm64.apk", "WordCraft-IA-0.8.1-linux-x64.zip"]
+            ),
             release("ia-v0.8.1-15", &["WordCraft-IA-0.8.1-windows-x64.zip"]),
             release("android-v0.9.0-android.1", &["WordCraft-Android-arm64.apk"]),
         ]);
@@ -150,6 +169,10 @@ mod tests {
         let android = latest(&reply, REPO, Target::Android, 3).unwrap();
         assert_eq!(android.build, 14);
         assert!(android.download.ends_with(".apk"));
+        // Likewise a build without the Linux zip is not an update for Linux.
+        let linux = latest(&reply, REPO, Target::Linux, 3).unwrap();
+        assert_eq!(linux.build, 14);
+        assert!(linux.download.ends_with("-linux-x64.zip"));
         assert_eq!(latest(&reply, REPO, Target::Windows, 15), None);
         assert_eq!(latest(&reply, REPO, Target::Android, 14), None);
     }

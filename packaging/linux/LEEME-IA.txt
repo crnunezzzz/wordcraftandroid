@@ -1,0 +1,33 @@
+WordCraft IA — WordCraft con el asistente de IA para Ubuntu (Linux x64)
+=======================================================================
+
+INSTALAR O ACTUALIZAR
+  1. Descomprime todo el zip (clic derecho › «Extraer aquí»).
+  2. Entra en la carpeta «WordCraft IA», clic derecho en un espacio vacío ›
+     «Abrir en una terminal», y escribe:  sh install-ia.sh
+  3. Abre «WordCraft IA» desde el menú de aplicaciones (tecla Super y escribe «WordCraft»).
+  (También funciona sin instalar: ./wordcraft desde la carpeta descomprimida.)
+
+  Necesita Ubuntu 22.04 o posterior (u otra distribución con glibc 2.35 o más).
+
+POR QUÉ ES UNA INSTALACIÓN APARTE
+  El WordCraft oficial (deb, AppImage, Flatpak) no trae el asistente. WordCraft IA vive en
+  ~/.local/opt/wordcraft-ia, así que las actualizaciones del oficial nunca lo borran. Las
+  mejoras del proyecto original llegan a WordCraft IA con las versiones nuevas que se publican
+  en GitHub (Releases del fork). La app avisa sola («Hay una versión nueva» › Actualizar):
+  descarga la versión, la instala, se cierra y se vuelve a abrir. Ajustes, documentos
+  recientes y claves se conservan.
+
+CONECTAR LA IA (pestaña Asistente › engranaje)
+  - Clave de API de OpenAI o de Anthropic: pagas por uso; la clave se guarda en
+    ~/.config/wordcraft/assistant-keys.json, legible solo por tu usuario.
+  - Plan de ChatGPT: usa Codex, la herramienta oficial de OpenAI, con tu sesión de ChatGPT.
+    «Instalar» lo instala con npm (si falta: sudo apt install nodejs npm).
+  - Plan de Claude: usa Claude Code, la herramienta oficial de Anthropic, con tu sesión de Claude.
+  Con un plan, la app nunca ve tu contraseña ni tus credenciales: «Instalar» e «Iniciar sesión»
+  abren en una terminal los instaladores y el inicio de sesión oficiales de cada proveedor.
+
+DESINSTALAR
+  rm -r ~/.local/opt/wordcraft-ia ~/.local/bin/wordcraft-ia \
+        ~/.local/share/applications/wordcraft-ia.desktop \
+        ~/.local/share/icons/hicolor/256x256/apps/wordcraft-ia.png
