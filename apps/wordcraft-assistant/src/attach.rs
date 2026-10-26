@@ -194,8 +194,7 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
         String::from_utf8_lossy(rest).into_owned()
     } else if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
         let le = bytes[0] == 0xFF;
-        let units: Vec<u16> =
-            bytes[2..].chunks_exact(2).map(|p| if le { u16::from_le_bytes([p[0], p[1]]) } else { u16::from_be_bytes([p[0], p[1]]) }).collect();
+        let units: Vec<u16> = bytes[2..].as_chunks::<2>().0.iter().map(|&p| if le { u16::from_le_bytes(p) } else { u16::from_be_bytes(p) }).collect();
         String::from_utf16_lossy(&units)
     } else if let Ok(s) = std::str::from_utf8(bytes) {
         s.to_owned()
