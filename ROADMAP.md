@@ -1,6 +1,6 @@
 # WordCraft roadmap
 
-> Android update · 2026-10-18: Android.4 adds explicit IME/hardware-key input, the original launcher icon, and a native Asistente tab with in-panel API settings. Device validation remains pending; see [Android notes](docs/android.md).
+> Android update · 2026-10-19: Android.6 fixes the system bars covering the app, recognises touch, mouse, stylus and touchpad gestures natively (scrolling, no accidental zoom), and rebuilds the assistant after PDF Scholar's with OpenAI (Responses API) and Anthropic only. Device validation remains pending; see [Android notes](docs/android.md).
 
 **Stage: alpha** · next: beta, ~15 points (60% → 75% ready for real work) and ~150–230 h away
 
@@ -714,6 +714,10 @@ Imported Word 97–2003 `.doc`/`.dot` files now ask for a supported DOCX target 
 | 2026-10-12 | trivial | Progress log: recipient filter and sort, .xls and legacy-encoding recipient lists (#778) |
 | 2026-10-15 | trivial | Progress log: dialog close box (#1885) |
 | 2026-10-15 | trivial | Progress log: mixed Hebrew/Latin text keeps its order in Word (#1543) |
+
+### 2026-10-19 — Android.6: native window, gestures and assistant
+
+Edge-to-edge window with system-bar, cutout and keyboard insets; Back no longer finishes the activity; pointer input recognised in the host (finger pan with momentum, tap, long press, pinch; mouse, stylus and touchpad as precise pointers), which removes the accidental multi-touch zoom; assistant panel redesigned after PDF Scholar's, OpenAI Responses and Anthropic Messages with native append-only histories and the current model lineup. Details and validation: [docs/android.md](docs/android.md).
 
 ### 2026-10-18 — Android host (initial integration)
 

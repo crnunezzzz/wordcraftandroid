@@ -1,0 +1,333 @@
+# WordCraft IA for Windows, Linux (Ubuntu) and Android: this fork's build with the AI assistant.
+#
+# Every day (and on demand) it merges the original project (storytold/wordcraft) into main, tests
+# the assistant on the merged code and publishes a new portable Windows build, a Linux x64 build
+# (packaging/linux/install-ia.sh) and the signed Android APK, as one GitHub release. Both apps look for these releases and offer the new build
+# («Hay una versión nueva»). The Craft Apps launcher keeps updating the official WordCraft; WordCraft IA is a
+# separate install (see packaging/windows/install-ia.ps1), so those updates never remove the
+# assistant, and this workflow brings the launcher's improvements into WordCraft IA.
+#
+# When the merge needs a person (both sides changed the same lines), nothing is pushed: the
+# workflow opens an issue and the last WordCraft IA release stays the current one.
+#
+# Optional secret SYNC_TOKEN: a personal access token with the `repo` and `workflow` scopes.
+# Without it the merge cannot be pushed when the original project changed its own workflow
+# files (GitHub refuses that to the default token); the issue then says so.
+#
+# Android needs the secrets ANDROID_KEYSTORE_BASE64 (the craft-release.p12 key, base64) and
+# ANDROID_KEYSTORE_PASSWORD: every APK must carry the same signature to install over the last.
+# Without them the release has the Windows zip only.
+name: IA Windows
+
+on:
+  schedule:
+    - cron: "37 9 * * *"
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: ia-windows
+  cancel-in-progress: false
+
+env:
+  APP: wordcraft
+  APP_TITLE: WordCraft
+  UPSTREAM: storytold/wordcraft
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  # Built into the apps: which build this is, and where to look for newer ones.
+  CRAFT_IA_BUILD: ${{ github.run_number }}
+  CRAFT_IA_REPO: ${{ github.repository }}
+
+jobs:
+  sync:
+    name: Merge the original project
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      changed: ${{ steps.merge.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Merge upstream main
+        id: merge
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream "https://github.com/$UPSTREAM.git"
+          git fetch --no-tags upstream main
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with $UPSTREAM."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git merge --no-edit upstream/main; then
+            conflicted=$(git diff --name-only --diff-filter=U)
+            # The lock file is regenerated from the merged manifests; anything else needs a person.
+            if [ "$conflicted" = "Cargo.lock" ]; then
+              git checkout --theirs Cargo.lock
+              cargo metadata --format-version 1 > /dev/null
+              git add Cargo.lock
+              git commit --no-edit
+            else
+              git merge --abort
+              printf '%s\n' "$conflicted" > conflicts.txt
+              echo "conflict=true" >> "$GITHUB_OUTPUT"
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Linux build dependencies
+        if: steps.merge.outputs.changed == 'true'
+        uses: storytold/craft-common-actions/actions/install-linux-deps@main
+      - name: Test the assistant and the app on the merged code
+        if: steps.merge.outputs.changed == 'true'
+        run: |
+          cargo test --locked -p "$APP-assistant" --lib
+          cargo check --locked -p "$APP"
+      - name: Push the merge
+        if: steps.merge.outputs.changed == 'true'
+        id: push
+        run: git push origin HEAD:main
+      - name: Open an issue when a person is needed
+        if: steps.merge.outputs.conflict == 'true' || failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          title="La sincronización con $UPSTREAM necesita revisión"
+          if [ -f conflicts.txt ]; then
+            body="El proyecto original cambió las mismas líneas que este fork en:
+          $(sed 's/^/- /' conflicts.txt)
+
+          No se publicó una versión nueva: la última de $APP_TITLE IA sigue disponible. Resuelve el conflicto (o pídeselo a Claude) y vuelve a lanzar el workflow «IA Windows»."
+          else
+            body="La fusión con $UPSTREAM, sus pruebas o el envío fallaron: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Si el error dice que falta el permiso «workflow», crea el secreto SYNC_TOKEN (un token personal con los permisos repo y workflow). No se publicó una versión nueva: la última de $APP_TITLE IA sigue disponible."
+          fi
+          existing=$(gh issue list --state open --search "$title in:title" --json number --jq '.[0].number')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+
+  windows:
+    name: Build for Windows
+    needs: sync
+    if: always() && needs.sync.result != 'failure' && (needs.sync.result == 'skipped' || needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: windows-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      sha: ${{ steps.package.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Check out craft-fonts
+        shell: bash
+        run: |
+          ref=$(sed -n 's/^ *craft-fonts-ref: *//p' .github/workflows/release.yml | head -n1)
+          if [ -n "$ref" ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
+            git -C craft-fonts checkout "$ref"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ia-windows
+      - name: Test the assistant on Windows
+        run: cargo test --locked -p "$env:APP-assistant" --lib --target x86_64-pc-windows-msvc
+      - name: Build
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: -C target-feature=+crt-static
+        run: cargo build --release --locked -p $env:APP -p "$env:APP-cli" --target x86_64-pc-windows-msvc
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $version = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq $env:APP | Select-Object -ExpandProperty version
+          $stage = "dist/$env:APP_TITLE IA"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item "target/x86_64-pc-windows-msvc/release/$env:APP.exe", "target/x86_64-pc-windows-msvc/release/$env:APP-cli.exe" $stage
+          Copy-Item packaging/windows/install-ia.ps1, packaging/windows/LEEME-IA.txt $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$env:APP_TITLE-IA-$version-windows-x64.zip"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ia-windows
+          path: dist/*.zip
+          retention-days: 3
+
+  linux:
+    name: Build for Linux
+    needs: sync
+    if: always() && needs.sync.result != 'failure' && (needs.sync.result == 'skipped' || needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch')
+    # The oldest supported Ubuntu, so the program runs on 22.04 and everything newer (glibc).
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - name: Check out craft-fonts
+        run: |
+          ref=$(sed -n 's/^ *craft-fonts-ref: *//p' .github/workflows/release.yml | head -n1)
+          if [ -n "$ref" ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
+            git -C craft-fonts checkout "$ref"
+          fi
+      - name: Linux build dependencies
+        uses: storytold/craft-common-actions/actions/install-linux-deps@main
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ia-linux
+      - name: Test the assistant on Linux
+        run: cargo test --locked -p "$APP-assistant" --lib
+      - name: Build
+        env:
+          CRAFT_FONTS_DIR: ${{ github.workspace }}/craft-fonts
+        run: cargo build --release --locked -p "$APP" -p "$APP-cli"
+      - name: Package
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg app "$APP" '.packages[] | select(.name == $app) | .version')
+          stage="dist/$APP_TITLE IA"
+          mkdir -p "$stage"
+          install -m755 "target/release/$APP" "target/release/$APP-cli" "$stage/"
+          strip "$stage/$APP" "$stage/$APP-cli"
+          install -m755 packaging/linux/install-ia.sh "$stage/"
+          install -m644 packaging/linux/LEEME-IA.txt "$stage/"
+          install -m644 "assets/app-icon/hicolor/256x256/apps/ai.storyteller.$APP.png" "$stage/$APP-ia.png"
+          (cd dist && zip -r -X "$APP_TITLE-IA-$version-linux-x64.zip" "$APP_TITLE IA")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ia-linux
+          path: dist/*.zip
+          retention-days: 3
+
+  android:
+    name: Build the signed Android APK
+    needs: sync
+    if: always() && needs.sync.result != 'failure' && (needs.sync.result == 'skipped' || needs.sync.outputs.changed == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NDK: 28.2.13676358
+    steps:
+      - name: Check for the signing key
+        id: key
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$KEYSTORE" ] || [ -z "$PASSWORD" ]; then
+            echo "::notice::No ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD secrets: this release has no APK."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            printf '%s' "$KEYSTORE" | base64 -d > "$RUNNER_TEMP/craft-release.p12"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.key.outputs.ready == 'true'
+        with:
+          ref: main
+      - uses: actions/setup-java@v4
+        if: steps.key.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.key.outputs.ready == 'true'
+        with:
+          targets: aarch64-linux-android
+      - uses: Swatinem/rust-cache@v2
+        if: steps.key.outputs.ready == 'true'
+        with:
+          key: ia-android
+      - uses: android-actions/setup-android@v3
+        if: steps.key.outputs.ready == 'true'
+        with:
+          packages: ''
+      - if: steps.key.outputs.ready == 'true'
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0' "ndk;$NDK"
+      - name: Build and sign
+        if: steps.key.outputs.ready == 'true'
+        env:
+          CRAFT_ANDROID_VARIANT: release
+          CRAFT_ANDROID_KEYSTORE: ${{ runner.temp }}/craft-release.p12
+          CRAFT_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r --arg app "$APP" '.packages[] | select(.name == $app) | .version')
+          export CRAFT_ANDROID_VERSION_CODE=$((100 + GITHUB_RUN_NUMBER))
+          export CRAFT_ANDROID_VERSION_NAME="$version-ia.$GITHUB_RUN_NUMBER"
+          "./apps/$APP-android/build-apk.sh"
+          mkdir -p dist
+          cp "apps/$APP-android/android/app/build/outputs/apk/release/app-release.apk" "dist/$APP_TITLE-IA-$version-Android-arm64.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose dist/*.apk
+      - uses: actions/upload-artifact@v4
+        if: steps.key.outputs.ready == 'true'
+        with:
+          name: ia-android
+          path: dist/*.apk
+          retention-days: 3
+
+  publish:
+    name: Publish the release
+    needs: [windows, linux, android]
+    if: always() && needs.windows.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ia-*
+          merge-multiple: true
+          path: dist
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.windows.outputs.version }}
+          SHA: ${{ needs.windows.outputs.sha }}
+        run: |
+          ls -l dist
+          if ls dist/*-linux-x64.zip > /dev/null 2>&1; then
+            linux="Ubuntu / Linux: descomprime el zip -linux-x64 y, en una terminal dentro de la carpeta, ejecuta sh install-ia.sh."
+          else
+            linux="Esta versión no trae la compilación de Linux (falló su compilación)."
+          fi
+          if ls dist/*.apk > /dev/null 2>&1; then
+            android="Android: descarga el .apk en el teléfono o la tablet y ábrelo para instalarlo encima del anterior."
+          else
+            android="Esta versión no trae APK de Android (faltan los secretos de firma o falló su compilación)."
+          fi
+          gh release create "ia-v$VERSION-$GITHUB_RUN_NUMBER" dist/* \
+            --target "$SHA" --latest \
+            --title "$APP_TITLE IA $VERSION (compilación $GITHUB_RUN_NUMBER)" \
+            --notes "$APP_TITLE con el asistente de IA, al día con $UPSTREAM.
+
+          Windows: descomprime el zip -windows-x64 y ejecuta install-ia.ps1 (clic derecho › Ejecutar con PowerShell). Se instala aparte del $APP_TITLE oficial, así que el launcher de Craft Apps no lo sobrescribe.
+
+          $linux
+
+          $android
+
+          Tus ajustes, documentos y claves se conservan. Las apps avisan solas cuando hay una versión nueva."

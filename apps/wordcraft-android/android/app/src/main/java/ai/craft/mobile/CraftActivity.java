@@ -1,6 +1,27 @@
 package ai.craft.mobile;
 
+import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.pm.PackageInstaller;
+import android.provider.Settings;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.ColorFilter;
+import android.graphics.Paint;
+import android.graphics.PixelFormat;
+import android.graphics.drawable.Drawable;
+import android.os.Build;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.Window;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowCompat;
+import androidx.core.view.WindowInsetsCompat;
+import androidx.core.view.WindowInsetsControllerCompat;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.net.Uri;
@@ -47,9 +68,14 @@ import java.util.zip.ZipOutputStream;
 public final class CraftActivity extends GameActivity {
     private EditorInputConnection editorConnection;
     private int pendingAccent;
-    private final ArrayBlockingQueue<JSONObject> inputEvents = new ArrayBlockingQueue<>(1024);
+    // Keys, IME edits and pointer events, in order. Guarded by itself.
+    private final ArrayDeque<JSONObject> inputEvents = new ArrayDeque<>();
     private static volatile CraftActivity current;
+    // Released whenever input or a platform event is queued; the native waker thread waits on it
+    // so the egui loop repaints at once instead of on its next timer tick.
+    private static final Semaphore wake = new Semaphore(0);
     private final ConcurrentLinkedQueue<JSONObject> events = new ConcurrentLinkedQueue<>();
+    private final BarsDrawable bars = new BarsDrawable();
     private final ExecutorService worker = Executors.newFixedThreadPool(2);
     private final ConcurrentHashMap<Long, HttpsURLConnection> requests = new ConcurrentHashMap<>();
     private final Set<Long> cancelled = ConcurrentHashMap.newKeySet();
@@ -61,14 +87,34 @@ public final class CraftActivity extends GameActivity {
     private final ConcurrentLinkedQueue<JSONObject> exportDialogs = new ConcurrentLinkedQueue<>();
     private static final int PICK = 4101;
     private static final int LIMIT = 128 * 1024 * 1024;
-    private static final int HTTP_LIMIT = 2 * 1024 * 1024;
-    private static final Set<String> PROVIDERS = new HashSet<>(Arrays.asList("openai", "anthropic", "gemini", "openrouter", "xai", "mistral", "groq", "azure", "custom"));
+    // Requests carry attached images and PDFs inline (base64); the providers accept 32 MB.
+    private static final int HTTP_LIMIT = 32 * 1024 * 1024;
+    private static final int CLIPBOARD_LIMIT = 2 * 1024 * 1024;
+    private static final int RESPONSE_LIMIT = 8 * 1024 * 1024;
+    private static final int INPUT_LIMIT = 4096;
+    // Larger than any build so far (about 60 MB); anything bigger is not ours.
+    private static final long APK_LIMIT = 400L * 1024 * 1024;
+    private static final String INSTALL_STATUS = "ai.craft.mobile.INSTALL_STATUS";
+    // The update being installed: one at a time.
+    private final java.util.concurrent.atomic.AtomicBoolean updating = new java.util.concurrent.atomic.AtomicBoolean();
+    // Downloaded, waiting for the user to allow this app to install updates.
+    private volatile File pendingApk;
+    private volatile int installSession = -1;
+    private BroadcastReceiver installReceiver;
+    // Each provider authenticates only against its own API host.
+    private static final Map<String, String> PROVIDERS = new HashMap<>();
+    static {
+        PROVIDERS.put("openai", "api.openai.com");
+        PROVIDERS.put("anthropic", "api.anthropic.com");
+    }
     static { System.loadLibrary("wordcraft_android"); }
 
     @Override protected void onCreate(Bundle state) {
         current = this;
         super.onCreate(state);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
+        installWindowChrome();
+        installPointerInput();
         sync.scheduleWithFixedDelay(this::flushSaves, 1, 1, TimeUnit.SECONDS);
         importIntent(getIntent());
     }
@@ -94,7 +140,7 @@ public final class CraftActivity extends GameActivity {
         info.inputType = InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE | InputType.TYPE_TEXT_FLAG_CAP_SENTENCES;
         info.imeOptions = EditorInfo.IME_FLAG_NO_EXTRACT_UI | EditorInfo.IME_FLAG_NO_FULLSCREEN | EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING;
         editorConnection = new EditorInputConnection(this, surface, info, new EditorInputConnection.Sink() {
-            public boolean event(JSONObject event) { return inputEvents.offer(event); }
+            public boolean event(JSONObject event) { return queueInput(event); }
             public boolean key(KeyEvent event) { return routeKey(event); }
         });
         editorConnection.setListener(this);
@@ -114,6 +160,14 @@ public final class CraftActivity extends GameActivity {
         if (editorConnection != null) editorConnection.setEditorInfo(getImeEditorInfo());
     }
     @Override public boolean dispatchKeyEvent(KeyEvent event) {
+        // Back (gesture, button or mouse) never finishes the activity: the editor decides whether
+        // it closes a panel, a menu or sends the app to the background with the document intact.
+        if (event.getKeyCode() == KeyEvent.KEYCODE_BACK) {
+            if (event.getAction() == KeyEvent.ACTION_UP && !event.isCanceled()) {
+                try { queueInput(new JSONObject().put("type", "back")); } catch (org.json.JSONException ignored) { }
+            }
+            return true;
+        }
         return routeKey(event) || super.dispatchKeyEvent(event);
     }
     private boolean routeKey(KeyEvent event) {
@@ -138,7 +192,7 @@ public final class CraftActivity extends GameActivity {
             }
             text += new String(Character.toChars(unicode));
         }
-        try { inputEvents.offer(new JSONObject().put("type", "key").put("code", code).put("down", down)
+        try { queueInput(new JSONObject().put("type", "key").put("code", code).put("down", down)
             .put("repeat", event.getRepeatCount() > 0).put("meta", meta).put("text", text).put("altgr", altgr && !text.isEmpty())); }
         catch (org.json.JSONException ignored) { }
         // Wake the native event loop; Rust discards these duplicate native key events.
@@ -163,13 +217,24 @@ public final class CraftActivity extends GameActivity {
                     if (in == null) throw new IOException("No input stream");
                     Files.write(file.toPath(), readLimited(in, LIMIT));
                 }
-                events.add(new JSONObject().put("kind", "file").put("external", true).put("path", file.getAbsolutePath()));
+                post(new JSONObject().put("kind", "file").put("external", true).put("path", file.getAbsolutePath()));
             } catch (Exception e) { emitFileError(new JSONObject(), "No se pudo importar el archivo compartido por Android"); }
         });
     }
 
+    @Override protected void onResume() {
+        super.onResume();
+        // Back from «Permitir de esta fuente»: carry on with the downloaded update.
+        File apk = pendingApk;
+        if (apk == null) return;
+        pendingApk = null;
+        if (getPackageManager().canRequestPackageInstalls()) worker.execute(() -> commitUpdate(apk));
+        else updateFailed("Sin el permiso «Permitir de esta fuente» Android no deja instalar la actualización.");
+    }
+
     @Override protected void onDestroy() {
         // Keep the Activity alive until Rust's android_main returns (super waits for its loop).
+        if (installReceiver != null) { try { unregisterReceiver(installReceiver); } catch (Exception ignored) { } installReceiver = null; }
         super.onDestroy();
         worker.shutdownNow();
         sync.shutdown();
@@ -187,10 +252,12 @@ public final class CraftActivity extends GameActivity {
         String op = request.getString("op");
         if (op.equals("input")) {
             JSONArray batch = new JSONArray();
-            for (int i = 0; i < 1024; i++) {
-                JSONObject event = inputEvents.poll();
-                if (event == null) break;
-                batch.put(event);
+            synchronized (inputEvents) {
+                for (int i = 0; i < 1024; i++) {
+                    JSONObject event = inputEvents.pollFirst();
+                    if (event == null) break;
+                    batch.put(event);
+                }
             }
             return batch;
         }
@@ -206,19 +273,28 @@ public final class CraftActivity extends GameActivity {
                 return new JSONObject();
             }
             case "keys": return keyFlags();
+            case "chrome": {
+                int top = request.optInt("top", Color.WHITE), bottom = request.optInt("bottom", top);
+                boolean dark = request.optBoolean("dark");
+                runOnUiThread(() -> applyChrome(top, bottom, dark));
+                return new JSONObject();
+            }
+            case "minimize":
+                runOnUiThread(() -> moveTaskToBack(true));
+                return new JSONObject();
             case "clipboard_get": {
                 ClipboardManager clipboard = (ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
                 ClipData clip = clipboard.getPrimaryClip();
                 ClipData.Item item = clip == null || clip.getItemCount() == 0 ? null : clip.getItemAt(0);
                 CharSequence plain = item == null ? null : item.getText();
                 String text = plain == null ? "" : plain.toString();
-                if (text.length() > HTTP_LIMIT) throw new IOException("Clipboard too large");
+                if (text.length() > CLIPBOARD_LIMIT) throw new IOException("Clipboard too large");
                 return new JSONObject().put("text", text).put("html", item == null || item.getHtmlText() == null ? "" : item.getHtmlText());
             }
             case "clipboard_set": {
                 String text = request.getString("text");
                 String html = request.optString("html");
-                if (text.length() > HTTP_LIMIT || html.length() > HTTP_LIMIT) throw new IOException("Clipboard too large");
+                if (text.length() > CLIPBOARD_LIMIT || html.length() > CLIPBOARD_LIMIT) throw new IOException("Clipboard too large");
                 runOnUiThread(() -> ((ClipboardManager) getSystemService(CLIPBOARD_SERVICE)).setPrimaryClip(html.isEmpty() ? ClipData.newPlainText("Craft", text) : ClipData.newHtmlText("Craft", text, html)));
                 return new JSONObject();
             }
@@ -295,6 +371,25 @@ public final class CraftActivity extends GameActivity {
                 provider(request);
                 worker.execute(() -> http(request));
                 return new JSONObject();
+            case "update_check": {
+                // Only GitHub's public list of this app's releases: no key, nothing of the user's.
+                String repo = request.getString("repo");
+                if (!repo.matches("[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}") || repo.contains("..")) throw new IOException("Bad repository");
+                long ticket = request.getLong("ticket");
+                worker.execute(() -> updateCheck(ticket, repo));
+                return new JSONObject();
+            }
+            case "update_install": {
+                // Only this app's own release files on GitHub, as the update check found them.
+                String repo = request.getString("repo");
+                if (!repo.matches("[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}") || repo.contains("..")) throw new IOException("Bad repository");
+                String url = request.getString("url");
+                if (!url.startsWith("https://github.com/" + repo + "/releases/download/") || !url.endsWith(".apk") || url.length() > 500
+                    || !url.matches("[\\x21-\\x7e]+") || url.contains("..")) throw new IOException("Bad address");
+                if (!updating.compareAndSet(false, true)) throw new IOException("Ya se está instalando una actualización");
+                worker.execute(() -> updateInstall(url));
+                return new JSONObject();
+            }
             case "cancel_http": {
                 long ticket = request.getLong("ticket");
                 cancelled.add(ticket);
@@ -308,7 +403,7 @@ public final class CraftActivity extends GameActivity {
 
     private String provider(JSONObject request) throws Exception {
         String id = request.getString("provider");
-        if (!PROVIDERS.contains(id)) throw new IOException("Unknown provider");
+        if (!PROVIDERS.containsKey(id)) throw new IOException("Unknown provider");
         return id;
     }
 
@@ -323,7 +418,7 @@ public final class CraftActivity extends GameActivity {
 
     private JSONObject keyFlags() throws Exception {
         JSONObject flags = new JSONObject();
-        for (String id : PROVIDERS) flags.put(id, getSharedPreferences("vault", MODE_PRIVATE).contains(id));
+        for (String id : PROVIDERS.keySet()) flags.put(id, getSharedPreferences("vault", MODE_PRIVATE).contains(id));
         return flags;
     }
 
@@ -342,40 +437,207 @@ public final class CraftActivity extends GameActivity {
         HttpsURLConnection connection = null;
         try {
             event.put("kind", "http").put("ticket", request.getLong("ticket"));
-            if (cancelled.remove(request.getLong("ticket"))) throw new IOException("Cancelled");
+            if (cancelled.remove(request.getLong("ticket"))) throw new InterruptedIOException("Cancelled");
+            String provider = provider(request);
             URL url = new URL(request.getString("url"));
-            if (!url.getProtocol().equals("https") || url.getUserInfo() != null || url.getRef() != null) throw new IOException("HTTPS required");
+            if (!url.getProtocol().equals("https") || url.getUserInfo() != null || url.getRef() != null
+                || !url.getHost().equals(PROVIDERS.get(provider)) || (url.getPort() != -1 && url.getPort() != 443)) throw new IOException("HTTPS required");
+            String value;
+            try { value = key(provider); }
+            catch (Exception e) { event.put("error", "missing_key"); return; }
             connection = (HttpsURLConnection) url.openConnection();
             requests.put(request.getLong("ticket"), connection);
             connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(20_000); connection.setReadTimeout(90_000);
+            // Reasoning models can think for minutes before the first byte of a reply.
+            connection.setConnectTimeout(20_000); connection.setReadTimeout(300_000);
             connection.setRequestMethod("POST"); connection.setDoOutput(true);
             connection.setRequestProperty("Content-Type", "application/json");
-            String api = request.getString("api");
-            String value = key(provider(request));
-            if (api.equals("anthropic")) {
+            if (provider.equals("anthropic")) {
                 connection.setRequestProperty("x-api-key", value);
                 connection.setRequestProperty("anthropic-version", "2023-06-01");
-            } else if (api.equals("gemini")) connection.setRequestProperty("x-goog-api-key", value);
-            else if (api.equals("azure")) connection.setRequestProperty("api-key", value);
-            else connection.setRequestProperty("Authorization", "Bearer " + value);
+                String beta = request.optString("beta");
+                if (beta.matches("[a-z0-9-]{1,64}(,[a-z0-9-]{1,64}){0,7}")) connection.setRequestProperty("anthropic-beta", beta);
+            } else connection.setRequestProperty("Authorization", "Bearer " + value);
             byte[] bytes = request.getJSONObject("body").toString().getBytes(StandardCharsets.UTF_8);
             if (bytes.length > HTTP_LIMIT) throw new IOException("Request too large");
             connection.setFixedLengthStreamingMode(bytes.length);
             try (OutputStream out = connection.getOutputStream()) { out.write(bytes); }
             int status = connection.getResponseCode();
-            if (status < 200 || status >= 300) {
-                String message = status == 401 || status == 403 ? "El proveedor rechazó la clave o su acceso al modelo" : status == 429 ? "Límite de uso o cuota del proveedor" : "El proveedor respondió HTTP " + status;
-                event.put("error", message);
-            } else {
-                try (InputStream in = connection.getInputStream()) { event.put("body", new JSONObject(new String(readLimited(in, HTTP_LIMIT), StandardCharsets.UTF_8))); }
+            event.put("status", status);
+            String retry = connection.getHeaderField("retry-after");
+            if (retry != null && retry.length() < 32) event.put("retry_after", retry);
+            boolean ok = status >= 200 && status < 300;
+            try (InputStream in = ok ? connection.getInputStream() : connection.getErrorStream()) {
+                String text = in == null ? "" : new String(readLimited(in, RESPONSE_LIMIT), StandardCharsets.UTF_8);
+                if (ok) event.put("body", new JSONObject(text));
+                else event.put("detail", text.length() > 6000 ? text.substring(0, 6000) : text);
             }
+        } catch (InterruptedIOException e) {
+            try { event.put("error", e instanceof java.net.SocketTimeoutException ? "timeout" : "cancelled"); } catch (Exception ignored) { }
+        } catch (java.net.UnknownHostException | java.net.ConnectException | javax.net.ssl.SSLException e) {
+            try { event.put("error", "offline"); } catch (Exception ignored) { }
         } catch (Exception e) {
-            try { event.put("error", "No se pudo consultar la API. Revisa la conexión, la clave, el endpoint y el modelo (" + e.getClass().getSimpleName() + ")."); } catch (Exception ignored) { }
+            try { event.put("error", "failed:" + e.getClass().getSimpleName()); } catch (Exception ignored) { }
         } finally {
             requests.remove(request.optLong("ticket")); cancelled.remove(request.optLong("ticket"));
-            if (connection != null) connection.disconnect(); events.add(event);
+            if (connection != null) connection.disconnect(); post(event);
         }
+    }
+
+    private void updateCheck(long ticket, String repo) {
+        JSONObject event = new JSONObject();
+        HttpsURLConnection connection = null;
+        try {
+            event.put("kind", "update").put("ticket", ticket);
+            connection = (HttpsURLConnection) new URL("https://api.github.com/repos/" + repo + "/releases?per_page=20").openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setConnectTimeout(15_000); connection.setReadTimeout(30_000);
+            connection.setRequestProperty("Accept", "application/vnd.github+json");
+            connection.setRequestProperty("User-Agent", "craft-ia-updates");
+            int status = connection.getResponseCode();
+            event.put("status", status);
+            if (status == 200) {
+                try (InputStream in = connection.getInputStream()) {
+                    event.put("body", new JSONArray(new String(readLimited(in, 4 * 1024 * 1024), StandardCharsets.UTF_8)));
+                }
+            }
+        } catch (Exception e) {
+            event.remove("status");
+        } finally {
+            if (connection != null) connection.disconnect();
+            post(event);
+        }
+    }
+
+    /** Download the APK (kept in the cache, so a retry does not fetch it again) and install it. */
+    private void updateInstall(String address) {
+        HttpsURLConnection connection = null;
+        try {
+            File dir = new File(getCacheDir(), "update");
+            if (!dir.isDirectory() && !dir.mkdirs()) throw new IOException("No cache");
+            File apk = new File(dir, Integer.toHexString(address.hashCode()) + ".apk");
+            if (!apk.isFile()) {
+                File[] old = dir.listFiles();
+                if (old != null) for (File f : old) f.delete();
+                URL url = new URL(address);
+                // GitHub redirects to its file storage (HTTPS too); follow at most a few hops.
+                for (int hop = 0; ; hop++) {
+                    connection = (HttpsURLConnection) url.openConnection();
+                    connection.setInstanceFollowRedirects(false);
+                    connection.setConnectTimeout(20_000); connection.setReadTimeout(60_000);
+                    connection.setRequestProperty("User-Agent", "craft-ia-updates");
+                    int status = connection.getResponseCode();
+                    if (status >= 300 && status < 400 && hop < 5) {
+                        URL next = new URL(url, connection.getHeaderField("Location"));
+                        if (!next.getProtocol().equals("https")) throw new IOException("HTTPS required");
+                        connection.disconnect(); url = next; continue;
+                    }
+                    if (status != 200) { updateFailed("GitHub respondió con un error (" + status + ") al descargar la actualización."); return; }
+                    break;
+                }
+                long total = connection.getContentLengthLong();
+                if (total > APK_LIMIT) throw new IOException("Too large");
+                File part = new File(dir, apk.getName() + ".part");
+                long done = 0, reported = 0, at = 0;
+                try (InputStream in = connection.getInputStream(); OutputStream out = new FileOutputStream(part)) {
+                    byte[] buffer = new byte[256 * 1024]; int size;
+                    while ((size = in.read(buffer)) != -1) {
+                        done += size;
+                        if (done > APK_LIMIT) throw new IOException("Too large");
+                        out.write(buffer, 0, size);
+                        long now = System.currentTimeMillis();
+                        if (done - reported >= 256 * 1024 && now - at >= 200) {
+                            reported = done; at = now;
+                            JSONObject event = new JSONObject().put("kind", "update_install").put("done", done);
+                            if (total > 0) event.put("total", total);
+                            post(event);
+                        }
+                    }
+                }
+                if (total > 0 && done != total) throw new IOException("Incomplete");
+                if (!part.renameTo(apk)) throw new IOException("Rename");
+            }
+            if (!getPackageManager().canRequestPackageInstalls()) {
+                // Android asks once whether this app may install updates; onResume carries on.
+                pendingApk = apk;
+                post(new JSONObject().put("kind", "update_install").put("state", "permission"));
+                runOnUiThread(() -> {
+                    try { startActivity(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:" + getPackageName()))); }
+                    catch (Exception e) { pendingApk = null; updateFailed("No se pudo abrir el ajuste de Android para permitir la instalación."); }
+                });
+                return;
+            }
+            commitUpdate(apk);
+        } catch (java.net.UnknownHostException | java.net.ConnectException | javax.net.ssl.SSLException | java.net.SocketTimeoutException e) {
+            updateFailed("No se pudo descargar la actualización: revisa la conexión.");
+        } catch (Exception e) {
+            updateFailed("No se pudo descargar la actualización (" + e.getClass().getSimpleName() + ").");
+        } finally {
+            if (connection != null) connection.disconnect();
+        }
+    }
+
+    /** Hand the APK to Android's installer; it asks the user to confirm (see installReceiver). */
+    private void commitUpdate(File apk) {
+        try {
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            // Android refuses the session unless the APK is this same app (and signed like it).
+            params.setAppPackageName(getPackageName());
+            params.setSize(apk.length());
+            int id = installer.createSession(params);
+            try (PackageInstaller.Session session = installer.openSession(id)) {
+                try (InputStream in = new FileInputStream(apk); OutputStream out = session.openWrite("update.apk", 0, apk.length())) {
+                    byte[] buffer = new byte[256 * 1024]; int size;
+                    while ((size = in.read(buffer)) != -1) out.write(buffer, 0, size);
+                    session.fsync(out);
+                }
+                listenForInstall();
+                installSession = id;
+                Intent status = new Intent(INSTALL_STATUS).setPackage(getPackageName());
+                int flags = PendingIntent.FLAG_UPDATE_CURRENT | (Build.VERSION.SDK_INT >= 31 ? PendingIntent.FLAG_MUTABLE : 0);
+                // Reported first: Android's answer (a failure, say) must come after it.
+                post(new JSONObject().put("kind", "update_install").put("state", "confirm"));
+                session.commit(PendingIntent.getBroadcast(this, id, status, flags).getIntentSender());
+            }
+        } catch (Exception e) {
+            updateFailed("Android no aceptó la actualización (" + e.getClass().getSimpleName() + ").");
+        }
+    }
+
+    private synchronized void listenForInstall() {
+        if (installReceiver != null) return;
+        installReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                // Only the session this app committed.
+                if (intent.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -2) != installSession) return;
+                int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS, PackageInstaller.STATUS_FAILURE);
+                if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                    Intent confirm = intent.getParcelableExtra(Intent.EXTRA_INTENT);
+                    if (confirm == null) { updateFailed("Android no mostró la ventana de instalación."); return; }
+                    try { startActivity(confirm.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)); }
+                    catch (Exception e) { updateFailed("Android no mostró la ventana de instalación."); }
+                } else if (status == PackageInstaller.STATUS_SUCCESS) {
+                    updating.set(false);
+                } else if (status == PackageInstaller.STATUS_FAILURE_ABORTED) {
+                    updateFailed("Se canceló la instalación. Pulsa «Reintentar» cuando quieras.");
+                } else if (status == PackageInstaller.STATUS_FAILURE_CONFLICT || status == PackageInstaller.STATUS_FAILURE_INCOMPATIBLE) {
+                    updateFailed("Android rechazó la actualización: la APK no está firmada con la misma clave que esta app.");
+                } else if (status == PackageInstaller.STATUS_FAILURE_STORAGE) {
+                    updateFailed("No hay espacio suficiente para instalar la actualización.");
+                } else {
+                    String message = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                    updateFailed("Android no pudo instalar la actualización" + (message == null ? "." : " (" + message.substring(0, Math.min(200, message.length())) + ")."));
+                }
+            }
+        };
+        // Private to this app on every version (before Android 13 through androidx's permission).
+        androidx.core.content.ContextCompat.registerReceiver(this, installReceiver, new IntentFilter(INSTALL_STATUS), androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED);
+    }
+
+    private void updateFailed(String message) {
+        updating.set(false);
+        try { post(new JSONObject().put("kind", "update_install").put("error", message)); } catch (Exception ignored) { }
     }
 
     private void showPicker(JSONObject request) {
@@ -395,7 +657,7 @@ public final class CraftActivity extends GameActivity {
         if (requestCode != PICK || pendingPicker == null) return;
         JSONObject request = pendingPicker; pendingPicker = null;
         if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            try { events.add(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("cancelled", true)); } catch (Exception ignored) { }
+            try { post(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("cancelled", true)); } catch (Exception ignored) { }
             return;
         }
         Uri uri = data.getData();
@@ -430,7 +692,7 @@ public final class CraftActivity extends GameActivity {
                     }
                     event.put("path", file.getAbsolutePath()).put("name", file.getName());
                 }
-                events.add(event);
+                post(event);
             } catch (Exception e) { emitFileError(request, "No se pudo leer o exportar el archivo. Se conserva la copia local."); }
         });
     }
@@ -485,7 +747,7 @@ public final class CraftActivity extends GameActivity {
     }
 
     private void emitFileError(JSONObject request, String message) {
-        try { events.add(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("error", message)); } catch (Exception ignored) { }
+        try { post(new JSONObject().put("kind", "file").put("ticket", request.optLong("ticket")).put("error", message)); } catch (Exception ignored) { }
     }
     private void flushSaves() {
         for (Map.Entry<File, Uri> entry : saves.entrySet()) {
@@ -498,7 +760,7 @@ public final class CraftActivity extends GameActivity {
                 byte[] buffer = new byte[32 * 1024]; int size;
                 while ((size = in.read(buffer)) != -1) out.write(buffer, 0, size);
                 out.flush(); savedTimes.put(file, version);
-                events.add(new JSONObject().put("kind", "saved").put("exported", true));
+                post(new JSONObject().put("kind", "saved").put("exported", true));
             } catch (Exception e) {
                 saves.remove(file);
                 emitFileError(new JSONObject(), "No se pudo actualizar el destino Android. Tu archivo está guardado localmente; usa Exportar a Android.");
@@ -523,6 +785,140 @@ public final class CraftActivity extends GameActivity {
         };
         ((PrintManager) getSystemService(PRINT_SERVICE)).print("Craft", adapter, null);
     }
+    private void post(JSONObject event) {
+        events.add(event);
+        wake.release();
+    }
+
+    /** Called from the native waker thread: blocks until input or an event arrives (or timeout). */
+    public static boolean awaitEvents(int millis) {
+        try {
+            boolean woke = wake.tryAcquire(Math.max(1, Math.min(millis, 5000)), TimeUnit.MILLISECONDS);
+            wake.drainPermits();
+            return woke;
+        } catch (InterruptedException e) {
+            return false;
+        }
+    }
+
+    /** Queues an input event for Rust. Consecutive moves of the same gesture collapse into the
+     *  latest one: their positions are absolute, so nothing is lost and a slow frame never
+     *  backs the queue up behind stale moves. */
+    private boolean queueInput(JSONObject event) {
+        synchronized (inputEvents) {
+            JSONObject last = inputEvents.peekLast();
+            if (last != null && event.optBoolean("coalesce") && last.optBoolean("coalesce")
+                && last.optInt("action") == event.optInt("action") && last.optInt("source") == event.optInt("source")
+                && last.optInt("count") == event.optInt("count") && last.optInt("cls") == event.optInt("cls")
+                && last.optInt("buttons") == event.optInt("buttons")) {
+                inputEvents.pollLast();
+            }
+            if (inputEvents.size() >= INPUT_LIMIT) return false;
+            inputEvents.addLast(event);
+        }
+        wake.release();
+        return true;
+    }
+
+    /** Draw edge to edge on every Android version and pad the editor by the system bars, the
+     *  display cutout and the keyboard. Android 15 enforces edge to edge for targetSdk 35, which
+     *  otherwise leaves the status and navigation bars over the ribbon and the status bar. */
+    private void installWindowChrome() {
+        Window window = getWindow();
+        WindowCompat.setDecorFitsSystemWindows(window, false);
+        window.setStatusBarColor(Color.TRANSPARENT);
+        window.setNavigationBarColor(Color.TRANSPARENT);
+        if (Build.VERSION.SDK_INT >= 29) {
+            window.setStatusBarContrastEnforced(false);
+            window.setNavigationBarContrastEnforced(false);
+        }
+        if (Build.VERSION.SDK_INT >= 28) {
+            WindowManager.LayoutParams attributes = window.getAttributes();
+            attributes.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES;
+            window.setAttributes(attributes);
+        }
+        if (mSurfaceView == null || !(mSurfaceView.getParent() instanceof View)) return;
+        View container = (View) mSurfaceView.getParent();
+        container.setBackground(bars);
+        ViewCompat.setOnApplyWindowInsetsListener(container, (view, insets) -> {
+            Insets system = insets.getInsets(WindowInsetsCompat.Type.systemBars() | WindowInsetsCompat.Type.displayCutout());
+            Insets ime = insets.getInsets(WindowInsetsCompat.Type.ime());
+            view.setPadding(system.left, system.top, system.right, Math.max(system.bottom, ime.bottom));
+            bars.setTopInset(system.top);
+            // Not consumed: GameActivity still reads the keyboard's visibility from these insets.
+            return insets;
+        });
+        ViewCompat.requestApplyInsets(container);
+    }
+
+    private void applyChrome(int top, int bottom, boolean dark) {
+        bars.setColors(top | 0xff000000, bottom | 0xff000000);
+        getWindow().getDecorView().setBackgroundColor(bottom | 0xff000000);
+        WindowInsetsControllerCompat controller = WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+        controller.setAppearanceLightStatusBars(!dark);
+        controller.setAppearanceLightNavigationBars(!dark);
+    }
+
+    /** Touch, stylus, mouse and touchpad reach Rust through the input queue; Rust recognises
+     *  taps, pans, long presses and pinches and turns them into editor events. GameActivity's
+     *  own listeners forwarded raw touches, which egui read as multi-touch zoom (the sudden
+     *  zooms) and as text selection instead of scrolling. */
+    private void installPointerInput() {
+        if (mSurfaceView == null) return;
+        mSurfaceView.setOnTouchListener((view, event) -> queuePointer(event));
+        mSurfaceView.setOnGenericMotionListener((view, event) -> queuePointer(event));
+    }
+
+    private boolean queuePointer(MotionEvent e) {
+        try {
+            int action = e.getActionMasked();
+            int count = Math.min(e.getPointerCount(), 10);
+            JSONArray pointers = new JSONArray();
+            for (int i = 0; i < count; i++) {
+                float x = e.getX(i), y = e.getY(i);
+                if (!Float.isFinite(x) || !Float.isFinite(y)) return true;
+                pointers.put(new JSONArray().put(e.getPointerId(i)).put((double) x).put((double) y).put(e.getToolType(i)));
+            }
+            int index = Math.min(e.getActionIndex(), Math.max(0, count - 1));
+            int classification = Build.VERSION.SDK_INT >= 29 ? e.getClassification() : 0;
+            JSONObject event = new JSONObject().put("type", "motion").put("action", action)
+                .put("id", count > 0 ? e.getPointerId(index) : 0).put("source", e.getSource())
+                .put("tool", count > 0 ? e.getToolType(index) : 0).put("buttons", e.getButtonState())
+                .put("action_button", e.getActionButton()).put("meta", e.getMetaState())
+                .put("time", e.getEventTime()).put("count", count).put("cls", classification).put("p", pointers);
+            if (action == MotionEvent.ACTION_SCROLL) {
+                float v = e.getAxisValue(MotionEvent.AXIS_VSCROLL), h = e.getAxisValue(MotionEvent.AXIS_HSCROLL);
+                event.put("vs", Float.isFinite(v) ? v : 0.0).put("hs", Float.isFinite(h) ? h : 0.0);
+            }
+            if (Build.VERSION.SDK_INT >= 34 && classification == MotionEvent.CLASSIFICATION_PINCH) {
+                float scale = e.getAxisValue(MotionEvent.AXIS_GESTURE_PINCH_SCALE_FACTOR);
+                event.put("pinch", Float.isFinite(scale) ? scale : 1.0);
+            }
+            event.put("coalesce", (action == MotionEvent.ACTION_MOVE || action == MotionEvent.ACTION_HOVER_MOVE)
+                && classification != 5);
+            queueInput(event);
+        } catch (org.json.JSONException ignored) { }
+        return true;
+    }
+
+    /** The window's background behind the status bar (top) and the navigation bar (bottom). */
+    private static final class BarsDrawable extends Drawable {
+        private final Paint paint = new Paint();
+        private int top = Color.WHITE, bottom = Color.WHITE, topInset;
+        void setColors(int top, int bottom) { this.top = top; this.bottom = bottom; invalidateSelf(); }
+        void setTopInset(int inset) { topInset = inset; invalidateSelf(); }
+        @Override public void draw(Canvas canvas) {
+            android.graphics.Rect r = getBounds();
+            paint.setColor(bottom);
+            canvas.drawRect(r, paint);
+            paint.setColor(top);
+            canvas.drawRect(r.left, r.top, r.right, r.top + Math.max(topInset, 0), paint);
+        }
+        @Override public void setAlpha(int alpha) { }
+        @Override public void setColorFilter(ColorFilter filter) { }
+        @Override public int getOpacity() { return PixelFormat.OPAQUE; }
+    }
+
     private static JSONObject error(String message) {
         JSONObject value = new JSONObject(); try { value.put("error", message); } catch (Exception ignored) { } return value;
     }
