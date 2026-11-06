@@ -9,6 +9,14 @@
 //! reply to [`latest`]. «Actualizar» then installs the file: on Windows and Linux the desktop
 //! host replaces this copy and reopens it (`desktop::install`); on Android Java hands the APK to the
 //! system's installer, which asks the user to confirm.
+//!
+//! The forks were renamed (`wordcraftandroid` → `wordcraft-asistente`, …, [`RENAMES`]). GitHub
+//! answers for both names, but its replies carry the new one: a build accepts release pages and
+//! files under either name, so builds made before and after the rename keep updating.
+//!
+//! The app also says when the original project has published a newer version than this build
+//! and no build of this fork carries it yet ([`behind`]): the update is on its way (or the
+//! automatic merge needs a look), instead of silence.
 #![forbid(unsafe_code)]
 
 use serde::{Deserialize, Serialize};
@@ -89,6 +97,47 @@ fn valid_repo(repo: &str) -> bool {
     ok(parts.next()) && ok(parts.next()) && parts.next().is_none()
 }
 
+/// Each fork's former name and its current one. GitHub redirects the former to the current, and
+/// its replies name the current one.
+pub const RENAMES: [(&str, &str); 3] = [
+    ("crnunezzzz/wordcraftandroid", "crnunezzzz/wordcraft-asistente"),
+    ("crnunezzzz/deckcraftandroid", "crnunezzzz/deckcraft-asistente"),
+    ("crnunezzzz/gridcraft", "crnunezzzz/gridcraft-asistente"),
+];
+
+/// `repo` and, when it was renamed (either way round), its other name.
+fn names(repo: &str) -> [&str; 2] {
+    let other = RENAMES.iter().find_map(|&(old, new)| {
+        if old.eq_ignore_ascii_case(repo) {
+            Some(new)
+        } else if new.eq_ignore_ascii_case(repo) {
+            Some(old)
+        } else {
+            None
+        }
+    });
+    [repo, other.unwrap_or(repo)]
+}
+
+/// `url` is `https://github.com/<repo>/<rest>…` for `repo` under any of its names.
+fn under(url: &str, repo: &str, rest: &str) -> bool {
+    names(repo).iter().any(|name| {
+        url.get(..19).is_some_and(|p| p == "https://github.com/")
+            && url.get(19..19 + name.len()).is_some_and(|n| n.eq_ignore_ascii_case(name))
+            && url.get(19 + name.len()..).is_some_and(|tail| tail.starts_with(rest))
+    })
+}
+
+/// The `owner/name` a GitHub release file belongs to (`https://github.com/<owner>/<name>/releases/download/…`).
+pub fn repo_of(url: &str) -> Option<&str> {
+    let rest = url.strip_prefix("https://github.com/")?;
+    let mut slashes = rest.match_indices('/').map(|(i, _)| i);
+    let _owner_end = slashes.next()?;
+    let name_end = slashes.next()?;
+    let repo = rest.get(..name_end)?;
+    (valid_repo(repo) && rest.get(name_end..).is_some_and(|t| t.starts_with("/releases/"))).then_some(repo)
+}
+
 /// GitHub's list of the repository's latest releases (no sign-in needed).
 pub fn api_url(repo: &str) -> Option<String> {
     valid_repo(repo).then(|| format!("https://api.github.com/repos/{repo}/releases?per_page=20"))
@@ -98,8 +147,6 @@ pub fn api_url(repo: &str) -> Option<String> {
 /// `current`. Drafts, other releases (the original project's) and addresses outside the
 /// repository's own release pages are ignored.
 pub fn latest(reply: &Value, repo: &str, target: Target, current: u64) -> Option<Release> {
-    let pages = format!("https://github.com/{repo}/releases/");
-    let files = format!("https://github.com/{repo}/releases/download/");
     let mut best: Option<Release> = None;
     for release in reply.as_array()?.iter().take(100) {
         if release["draft"].as_bool() != Some(false) || release["prerelease"].as_bool() == Some(true) {
@@ -111,11 +158,11 @@ pub fn latest(reply: &Value, repo: &str, target: Target, current: u64) -> Option
         if build <= current || best.as_ref().is_some_and(|b| b.build >= build) || version.is_empty() || version.len() > 40 {
             continue;
         }
-        let Some(page) = release["html_url"].as_str().filter(|u| u.starts_with(&pages) && safe_url(u)) else { continue };
+        let Some(page) = release["html_url"].as_str().filter(|u| under(u, repo, "/releases/") && safe_url(u)) else { continue };
         let download = release["assets"].as_array().into_iter().flatten().find_map(|asset| {
             let name = asset["name"].as_str()?;
             let url = asset["browser_download_url"].as_str()?;
-            (target.wants(name) && url.starts_with(&files) && safe_url(url)).then(|| url.to_owned())
+            (target.wants(name) && under(url, repo, "/releases/download/") && safe_url(url)).then(|| url.to_owned())
         });
         let Some(download) = download else { continue };
         best = Some(Release { build, version: version.to_owned(), page: page.to_owned(), download });
@@ -130,11 +177,14 @@ pub struct Checked {
     pub release: Option<Release>,
     /// Why the automatic updates look stopped, when they do ([`stale`]).
     pub stale: Option<String>,
+    /// The original project published a newer version that no build of ours carries yet
+    /// ([`behind`]); the desktop host fills it in.
+    pub behind: Option<String>,
 }
 
 /// [`latest`] and [`stale`] from one reply (`now` in Unix seconds).
 pub fn check(reply: &Value, repo: &str, target: Target, current: u64, now: u64) -> Checked {
-    Checked { release: latest(reply, repo, target, current), stale: stale(reply, repo, target, now) }
+    Checked { release: latest(reply, repo, target, current), stale: stale(reply, repo, target, now), behind: None }
 }
 
 /// When `repo`'s newest published build with a file for `target` is older than [`STALE_SECS`],
@@ -142,7 +192,6 @@ pub fn check(reply: &Value, repo: &str, target: Target, current: u64, now: u64) 
 /// build) has stopped and needs a look. `None` when a recent build exists, when the list has no
 /// such build at all (nothing published yet) or is junk.
 pub fn stale(reply: &Value, repo: &str, target: Target, now: u64) -> Option<String> {
-    let pages = format!("https://github.com/{repo}/releases/");
     let has_file = |r: &Value| r["assets"].as_array().into_iter().flatten().any(|a| a["name"].as_str().is_some_and(|n| target.wants(n)));
     let newest = reply
         .as_array()?
@@ -150,7 +199,7 @@ pub fn stale(reply: &Value, repo: &str, target: Target, now: u64) -> Option<Stri
         .take(100)
         .filter(|r| r["draft"].as_bool() == Some(false) && r["prerelease"].as_bool() != Some(true))
         .filter(|r| r["tag_name"].as_str().is_some_and(|t| t.starts_with("ia-v")))
-        .filter(|r| r["html_url"].as_str().is_some_and(|u| u.starts_with(&pages)))
+        .filter(|r| r["html_url"].as_str().is_some_and(|u| under(u, repo, "/releases/")))
         .filter(|r| has_file(r))
         .filter_map(|r| r["published_at"].as_str().and_then(unix_time))
         .max()?;
@@ -162,6 +211,39 @@ pub fn stale(reply: &Value, repo: &str, target: Target, now: u64) -> Option<Stri
     Some(format!(
         "Las actualizaciones automáticas están detenidas: la última versión se publicó el {d:02}/{m:02}/{y} (hace {} días) y el proyecto original sigue avanzando. La fusión necesita revisión: abre github.com/{repo}/actions, flujo «IA Windows».",
         age / 86_400
+    ))
+}
+
+/// GitHub's address of the original project's newest published release.
+pub fn official_url(upstream: &str) -> Option<String> {
+    valid_repo(upstream).then(|| format!("https://api.github.com/repos/{upstream}/releases/latest"))
+}
+
+/// `0.15.2` or `v0.15.2` as numbers; `None` for anything else (pre-releases included).
+fn version(text: &str) -> Option<(u64, u64, u64)> {
+    let text = text.strip_prefix('v').unwrap_or(text);
+    let mut parts = text.split('.');
+    let mut part = || parts.next().filter(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))?.parse::<u64>().ok();
+    let v = (part()?, part()?, part()?);
+    parts.next().is_none().then_some(v)
+}
+
+/// When the original project's newest release (`official`, GitHub's `releases/latest` reply) is
+/// newer than this build's `current` version and no build of this fork carries it yet (`newer`,
+/// what [`latest`] found), what to tell the user: the official version is out and this fork's
+/// build follows once the automatic merge has run. `None` otherwise, or for a junk reply.
+pub fn behind(official: &Value, current: &str, newer: Option<&Release>, repo: &str) -> Option<String> {
+    if official["draft"].as_bool() == Some(true) || official["prerelease"].as_bool() == Some(true) {
+        return None;
+    }
+    let tag = official["tag_name"].as_str()?;
+    let out = version(tag)?;
+    if out <= version(current)? || newer.and_then(|r| version(&r.version)).is_some_and(|v| v >= out) {
+        return None;
+    }
+    let (a, b, c) = out;
+    Some(format!(
+        "Ya salió la versión oficial {a}.{b}.{c}; esta es la {current}. La versión con el asistente se publica sola cuando termina la sincronización automática (normalmente en menos de un día) y aquí verás «Hay una versión nueva». Si tarda más, revisa github.com/{repo}/actions, flujo «IA Windows».",
     ))
 }
 
@@ -316,6 +398,58 @@ mod tests {
         let mut elsewhere = published("ia-v0.8.0-1", "2026-01-01T00:00:00Z");
         elsewhere["html_url"] = json!("https://github.com/attacker/x/releases/tag/ia-v0.8.0-1");
         assert_eq!(stale(&json!([elsewhere]), REPO, Target::Linux, now), None);
+    }
+
+    #[test]
+    fn builds_from_before_and_after_the_rename_find_each_other() {
+        let renamed = "crnunezzzz/wordcraft-asistente";
+        let tag = "ia-v0.15.2-13";
+        let name = "WordCraft-IA-0.15.2-linux-x64.zip";
+        let reply = json!([{
+            "tag_name": tag, "draft": false, "prerelease": false, "published_at": "2026-11-06T10:00:00Z",
+            "html_url": format!("https://github.com/{renamed}/releases/tag/{tag}"),
+            "assets": [{"name": name, "browser_download_url": format!("https://github.com/{renamed}/releases/download/{tag}/{name}")}],
+        }]);
+        // A build made under the former name, and one under the new name.
+        for repo in ["crnunezzzz/wordcraftandroid", renamed] {
+            let found = latest(&reply, repo, Target::Linux, 9).unwrap();
+            assert_eq!(found.build, 13, "{repo}");
+            assert_eq!(repo_of(&found.download), Some(renamed));
+        }
+        // An unrelated repository's releases are still not ours.
+        assert_eq!(latest(&reply, "crnunezzzz/pdfcraftandroid", Target::Linux, 9), None);
+        assert_eq!(latest(&reply, "someone/else", Target::Linux, 9), None);
+        assert!(!under("https://github.com/crnunezzzz/wordcraft-asistentex/releases/x", renamed, "/releases/"));
+        assert_eq!(repo_of("https://github.com/a/b/c"), None);
+        assert_eq!(repo_of("https://example.com/a/b/releases/download/x"), None);
+    }
+
+    #[test]
+    fn a_newer_official_version_without_an_ia_build_is_announced() {
+        let official = json!({"tag_name": "v0.15.2", "draft": false, "prerelease": false});
+        let notice = behind(&official, "0.15.0", None, REPO).unwrap();
+        assert!(notice.contains("0.15.2") && notice.contains("0.15.0") && notice.contains(REPO), "{notice}");
+        // Already on it, or newer (a local build), or an IA build carrying it is offered.
+        assert_eq!(behind(&official, "0.15.2", None, REPO), None);
+        assert_eq!(behind(&official, "0.16.0", None, REPO), None);
+        let offered = Release { build: 13, version: "0.15.2".into(), page: String::new(), download: String::new() };
+        assert_eq!(behind(&official, "0.15.0", Some(&offered), REPO), None);
+        // An IA build of an older version does not cover it.
+        let older = Release { version: "0.15.1".into(), ..offered };
+        assert!(behind(&official, "0.15.0", Some(&older), REPO).is_some());
+        // Pre-releases, drafts and junk say nothing.
+        for junk in [
+            json!({"tag_name": "v0.16.0-rc.1"}),
+            json!({"tag_name": "v0.16.0", "prerelease": true}),
+            json!({"tag_name": "v0.16.0", "draft": true}),
+            json!({"message": "Not Found"}),
+            json!({"tag_name": "v1.2"}),
+            json!({"tag_name": "v1.2.3.4"}),
+            json!({"tag_name": "v99999999999.0.0"}),
+        ] {
+            assert_eq!(behind(&junk, "0.15.0", None, REPO), None, "{junk}");
+        }
+        assert_eq!(official_url("storytold/wordcraft").as_deref(), Some("https://api.github.com/repos/storytold/wordcraft/releases/latest"));
     }
 
     #[test]

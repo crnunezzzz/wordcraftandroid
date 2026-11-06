@@ -559,7 +559,8 @@ impl Mobile {
                     if let Some(release) = &self.assistant.update
                         && self.assistant.installing.is_none()
                     {
-                        let request = json!({"op":"update_install","repo":update::repo(crate::RELEASES),"url":release.download});
+                        let repo = update::repo_of(&release.download).unwrap_or(update::repo(crate::RELEASES));
+                        let request = json!({"op":"update_install","repo":repo,"url":release.download});
                         match self.platform.exchange(request) {
                             Ok(_) => {
                                 self.assistant.install_error = None;

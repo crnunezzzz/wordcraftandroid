@@ -1,6 +1,8 @@
 # WordCraft IA for Windows, Linux (Ubuntu) and Android: this fork's build with the AI assistant.
 #
-# Every day (and on demand) it merges the original project (storytold/wordcraft) into main, tests
+# Every day (and on demand) it merges the original project's published version (the `release`
+# branch of storytold/wordcraft) into main — the same version the official app ships, with its
+# version number, so «Hay una versión nueva» follows the official releases — tests
 # the assistant on the merged code (Linux and the Android target), and publishes a new portable
 # Windows build, a Linux x64 build (packaging/linux/install-ia.sh) and the signed Android APK, as
 # one GitHub release. The apps look for these releases and offer the new build («Hay una versión
@@ -22,6 +24,10 @@
 # Secret SYNC_TOKEN (needed): a personal access token with the `repo` and `workflow` scopes.
 # GitHub refuses the default token a push that changes workflow files, and the original project
 # changes its own often.
+#
+# The interface translations (Español and the rest) and the spelling word lists come from
+# storytold/craft-i18n at the SHA in craft-i18n.rev, as in the official release; a build without
+# them would be English only, so the builds require them when the app uses craft-i18n.
 #
 # Android needs the secrets ANDROID_KEYSTORE_BASE64 (the craft-release.p12 key, base64) and
 # ANDROID_KEYSTORE_PASSWORD: every APK must carry the same signature to install over the last.
@@ -48,6 +54,8 @@ concurrency:
 env:
   APP: wordcraft
   APP_TITLE: WordCraft
+  # The branch the official releases are cut from (each «Release x.y.z» lands there).
+  UPSTREAM_BRANCH: release
   UPSTREAM: storytold/wordcraft
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
@@ -77,14 +85,14 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream "https://github.com/$UPSTREAM.git"
-          git fetch --no-tags upstream main
-          if git merge-base --is-ancestor upstream/main HEAD; then
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          if git merge-base --is-ancestor "upstream/$UPSTREAM_BRANCH" HEAD; then
             echo "Already up to date with $UPSTREAM."
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           status=0
-          bash .github/ia/sync-upstream.sh upstream/main || status=$?
+          bash .github/ia/sync-upstream.sh "upstream/$UPSTREAM_BRANCH" || status=$?
           case "$status" in
             0) echo "changed=true" >> "$GITHUB_OUTPUT" ;;
             2) echo "conflict=true" >> "$GITHUB_OUTPUT" ;;
@@ -95,7 +103,17 @@ jobs:
         if: steps.merge.outputs.conflict == 'true'
         env:
           TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-        run: echo "ready=$([ -n "$TOKEN" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+        # A token pasted with a stray space or line break makes Claude stop at once (is_error after
+        # 0.2 s): the action gets it without them.
+        run: |
+          token=$(printf '%s' "$TOKEN" | tr -d '[:space:]')
+          if [ -n "$token" ]; then
+            echo "::add-mask::$token"
+            echo "CLAUDE_TOKEN=$token" >> "$GITHUB_ENV"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Linux build dependencies
         if: steps.merge.outputs.changed == 'true' || steps.claude.outputs.ready == 'true'
         uses: storytold/craft-common-actions/actions/install-linux-deps@main
@@ -112,14 +130,14 @@ jobs:
         if: steps.claude.outputs.ready == 'true'
         uses: anthropics/claude-code-action@v1
         with:
-          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_code_oauth_token: ${{ env.CLAUDE_TOKEN }}
           claude_args: >-
             --max-turns 120
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash(cargo check:*),Bash(cargo test:*),Bash(cargo clippy:*),Bash(cargo metadata:*),Bash(git diff:*),Bash(git status:*),Bash(git show:*),Bash(git log:*),Bash(git add:*)"
           prompt: |
-            A merge of the original project (${{ env.UPSTREAM }}, branch main) into this fork is in progress and has conflicts in the files listed in `conflicts.txt`. Resolve them, then stop. Do not commit, push, or start another merge.
+            A merge of the original project (${{ env.UPSTREAM }}, branch ${{ env.UPSTREAM_BRANCH }}) into this fork is in progress and has conflicts in the files listed in `conflicts.txt`. Resolve them, then stop. Do not commit, push, or start another merge.
 
-            This fork is the original project plus an AI assistant: `apps/${{ env.APP }}-assistant`, `apps/${{ env.APP }}-android` and `apps/${{ env.APP }}/src/assistant_host.rs` are ours and absent upstream. In the original's files, our changes are a few small seams (the ribbon's Asistente tab through `host_toolbar`, `Services::host_toolbar`, the four `assistant_host::` calls and `maybe_serve_mcp` in `main.rs`, the Android font folders, the updater redirect). Rules:
+            This fork is the original project plus an AI assistant: `apps/${{ env.APP }}-assistant`, `apps/${{ env.APP }}-android` and `apps/${{ env.APP }}/src/assistant_host.rs` are ours and absent upstream. In the original's files, our changes are a few small seams (the ribbon's Asistente tab and its pin button through `host_toolbar` (`ribbon_pin`, `tab_clicked`, `clicked` in `ribbon.rs`), `Services::host_toolbar`, the `assistant_host::` calls and `maybe_serve_mcp` in `main.rs` (including `assistant_host::native_wayland()` in the XWayland condition), the Android font folders, the updater redirect). Rules:
             1. Take the original's version of every conflicted region, then put our seam back into it. Never drop upstream code to keep ours, never drop a seam.
             2. Where the original renamed or moved what a seam touches, follow the move. If an API our crates use changed, update our crates to the new API.
             3. Read `CLAUDE.md` first: no unwrap/expect/panic in non-test code; keep it compiling for wasm.
@@ -265,6 +283,15 @@ jobs:
             git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
             git -C craft-fonts checkout "$ref"
           fi
+      - name: Check out craft-i18n (interface translations, spelling lists)
+        shell: bash
+        run: |
+          if [ -f craft-i18n.rev ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-i18n.git craft-i18n
+            git -C craft-i18n checkout "$(tr -d '[:space:]' < craft-i18n.rev)"
+            echo "CRAFT_I18N_DIR=$GITHUB_WORKSPACE/craft-i18n" >> "$GITHUB_ENV"
+            echo "CRAFT_I18N_REQUIRED=1" >> "$GITHUB_ENV"
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -316,6 +343,15 @@ jobs:
           if [ -n "$ref" ]; then
             git clone --filter=blob:none https://github.com/storytold/craft-fonts.git craft-fonts
             git -C craft-fonts checkout "$ref"
+          fi
+      - name: Check out craft-i18n (interface translations, spelling lists)
+        shell: bash
+        run: |
+          if [ -f craft-i18n.rev ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-i18n.git craft-i18n
+            git -C craft-i18n checkout "$(tr -d '[:space:]' < craft-i18n.rev)"
+            echo "CRAFT_I18N_DIR=$GITHUB_WORKSPACE/craft-i18n" >> "$GITHUB_ENV"
+            echo "CRAFT_I18N_REQUIRED=1" >> "$GITHUB_ENV"
           fi
       - name: Linux build dependencies
         uses: storytold/craft-common-actions/actions/install-linux-deps@main
@@ -375,6 +411,16 @@ jobs:
         if: steps.key.outputs.ready == 'true'
         with:
           ref: main
+      - name: Check out craft-i18n (interface translations, spelling lists)
+        if: steps.key.outputs.ready == 'true'
+        shell: bash
+        run: |
+          if [ -f craft-i18n.rev ]; then
+            git clone --filter=blob:none https://github.com/storytold/craft-i18n.git craft-i18n
+            git -C craft-i18n checkout "$(tr -d '[:space:]' < craft-i18n.rev)"
+            echo "CRAFT_I18N_DIR=$GITHUB_WORKSPACE/craft-i18n" >> "$GITHUB_ENV"
+            echo "CRAFT_I18N_REQUIRED=1" >> "$GITHUB_ENV"
+          fi
       - uses: actions/setup-java@v4
         if: steps.key.outputs.ready == 'true'
         with:

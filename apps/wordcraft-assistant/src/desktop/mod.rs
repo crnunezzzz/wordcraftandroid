@@ -41,6 +41,20 @@ pub fn maybe_serve_mcp() -> bool {
     false
 }
 
+/// Whether the window should open natively on Wayland rather than through XWayland: on a
+/// Wayland session (Linux, BSD), unless `x11_var` (`WORDCRAFT_X11`, …) is set.
+///
+/// The original project runs through XWayland whenever `DISPLAY` is set, because winit has no
+/// file drag-and-drop on Wayland. Its official Linux build is a Flatpak with X11 only as a
+/// fallback, so on Wayland it opens natively, with winit's slim window controls; this build,
+/// installed as a plain program, saw `DISPLAY` and went through XWayland, where the desktop adds
+/// its own title bar (repeating the document name) above the app's. Opening natively looks like
+/// the official app; dropping files from the file manager then needs `x11_var=1`, as there.
+pub fn native_wayland(x11_var: &str) -> bool {
+    let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+    cfg!(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android")))) && set("WAYLAND_DISPLAY") && !set(x11_var)
+}
+
 // The assistant's clocks only time a run and its checks.
 #[allow(clippy::disallowed_methods)]
 fn now() -> Instant {
@@ -254,7 +268,15 @@ impl Desktop {
         self.save_settings();
         let tx = self.updates.0.clone();
         let spawned = std::thread::Builder::new().name("craft-update-check".into()).spawn(move || {
-            let result = http::releases(&url).map(|reply| update::check(&reply, update::repo(crate::RELEASES), target, update::build(), unix_now()));
+            let repo = update::repo(crate::RELEASES);
+            let result = http::releases(&url).map(|reply| {
+                let mut checked = update::check(&reply, repo, target, update::build(), unix_now());
+                // The original project's newest version, when no build of ours carries it yet.
+                // A failed look changes nothing: the next check asks again.
+                let official = update::official_url(crate::UPSTREAM).and_then(|url| http::releases(&url).ok());
+                checked.behind = official.and_then(|official| update::behind(&official, env!("CARGO_PKG_VERSION"), checked.release.as_ref(), repo));
+                checked
+            });
             let _ = tx.send(result);
         });
         if spawned.is_err() {

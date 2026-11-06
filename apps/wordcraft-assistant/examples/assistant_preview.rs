@@ -115,8 +115,9 @@ fn scenario(name: &str) -> Assistant {
             a.update = Some(wordcraft_assistant::update::Release {
                 build: 42,
                 version: "0.8.1".into(),
-                page: "https://github.com/crnunezzzz/wordcraftandroid/releases/tag/ia-v0.8.1-42".into(),
-                download: "https://github.com/crnunezzzz/wordcraftandroid/releases/download/ia-v0.8.1-42/WordCraft-IA-0.8.1-windows-x64.zip".into(),
+                page: "https://github.com/crnunezzzz/wordcraft-asistente/releases/tag/ia-v0.8.1-42".into(),
+                download: "https://github.com/crnunezzzz/wordcraft-asistente/releases/download/ia-v0.8.1-42/WordCraft-IA-0.8.1-windows-x64.zip"
+                    .into(),
             });
         }
         "update-settings" => {

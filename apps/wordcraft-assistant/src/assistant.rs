@@ -217,6 +217,9 @@ pub struct Assistant {
     /// settings and, until dismissed for this session, as a notice over the editor.
     pub update_stale: Option<String>,
     pub update_stale_dismissed: bool,
+    /// The original project has a newer version that no build of this fork carries yet
+    /// (`update::behind`): shown like [`Self::update_stale`], which goes first.
+    pub update_behind: Option<String>,
     /// An install in progress.
     pub installing: Option<Installing>,
     /// Why the last install failed, shown in the notice.
@@ -556,6 +559,7 @@ impl Assistant {
         self.update_checking = false;
         if let Ok(checked) = &result {
             self.update_stale = checked.stale.clone();
+            self.update_behind = checked.behind.clone();
         }
         match result.map(|checked| checked.release) {
             Ok(Some(release)) => {
@@ -564,7 +568,11 @@ impl Assistant {
             }
             Ok(None) => {
                 self.update = None;
-                self.update_status = Some("Tienes la versión más reciente.".into());
+                self.update_status = Some(if self.update_behind.is_some() {
+                    "Todavía no hay una versión con el asistente más nueva que esta.".into()
+                } else {
+                    "Tienes la versión más reciente.".into()
+                });
             }
             Err(e) => self.update_status = Some(e),
         }
@@ -686,9 +694,14 @@ impl Assistant {
         self.actions.extend(chosen);
     }
 
-    /// The automatic updates stopped: say so over the editor, so a stuck merge is never silent.
+    /// The automatic updates stopped, or the original project has a newer version than this
+    /// build: say so over the editor, so a stuck merge or a pending update is never silent.
     fn stale_notice(&mut self, ctx: &Context) {
-        let Some(warning) = self.update_stale.clone() else { return };
+        let (title, warning, stopped) = match (&self.update_stale, &self.update_behind) {
+            (Some(w), _) => ("Las actualizaciones se detuvieron", w.clone(), true),
+            (None, Some(w)) => ("Ya salió una versión oficial nueva", w.clone(), false),
+            (None, None) => return,
+        };
         if self.update_stale_dismissed {
             return;
         }
@@ -703,13 +716,13 @@ impl Assistant {
                 let palette = Palette::of(ui);
                 Frame::new()
                     .fill(palette.bg)
-                    .stroke(Stroke::new(1.5, palette.error))
+                    .stroke(Stroke::new(1.5, if stopped { palette.error } else { palette.accent }))
                     .corner_radius(14)
                     .inner_margin(Margin::same(14))
                     .shadow(egui::Shadow { offset: [0, 3], blur: 14, spread: 0, color: Color32::from_black_alpha(50) })
                     .show(ui, |ui| {
                         ui.set_width(width - 28.0);
-                        ui.label(RichText::new("Las actualizaciones se detuvieron").strong().size(15.5).color(palette.strong));
+                        ui.label(RichText::new(title).strong().size(15.5).color(palette.strong));
                         ui.add_space(4.0);
                         ui.add(egui::Label::new(RichText::new(warning).color(palette.text)).wrap());
                         ui.add_space(10.0);
@@ -1080,6 +1093,9 @@ impl Assistant {
         if let Some(stale) = &self.update_stale {
             ui.add_space(4.0);
             ui.add(egui::Label::new(RichText::new(stale).color(palette.error)).wrap());
+        } else if let Some(behind) = &self.update_behind {
+            ui.add_space(4.0);
+            ui.add(egui::Label::new(RichText::new(behind).color(palette.text)).wrap());
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
